@@ -1,0 +1,21 @@
+# 编译产物
+build/
+mx.scratch
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.su
+*.bak
+
+# 本地工具配置（Claude Code 权限记录等，不随仓库共享）
+.claude/
+
+# MDK/IAR 预编译数学库：GCC 工具链不使用
+Drivers/CMSIS/Lib/
+
+# CMSIS DSP 示例工程：不参与编译
+Drivers/CMSIS/DSP/Examples/
