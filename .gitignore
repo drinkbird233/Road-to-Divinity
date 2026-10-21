@@ -1,0 +1,17 @@
+# Keil 编译产物
+Objects/
+Listings/
+*.o
+*.d
+*.hex
+*.axf
+*.lst
+*.map
+*.crf
+*.dep
+*.uvguix.*
+
+# 系统杂项
+Thumbs.db
+desktop.ini
+.DS_Store
