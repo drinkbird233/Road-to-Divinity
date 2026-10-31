@@ -1,0 +1,18 @@
+# Keil 编译产物
+MDK-ARM/MyMP3/
+Objects/
+Listings/
+*.o
+*.d
+*.crf
+*.dep
+*.axf
+*.hex
+*.map
+*.lst
+*.iex
+*.sct
+*.htm
+*.lnp
+*.uvguix.*
+build_baseline.log
