@@ -336,7 +336,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F407xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Bsp/Es8388;../FATFS/Target;../FATFS/App;../Middlewares/Third_Party/FatFs/src</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Bsp/Es8388;../Bsp/Mp3;../FATFS/Target;../FATFS/App;../Middlewares/Third_Party/FatFs/src</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -1214,6 +1214,16 @@
               <FileName>es8388.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Bsp/Es8388/es8388.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>Bsp/Mp3</GroupName>
+          <Files>
+            <File>
+              <FileName>mp3.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Bsp/Mp3/mp3.c</FilePath>
             </File>
           </Files>
         </Group>
