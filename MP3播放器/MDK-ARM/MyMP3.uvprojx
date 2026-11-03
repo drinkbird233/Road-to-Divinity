@@ -1225,6 +1225,11 @@
               <FileType>1</FileType>
               <FilePath>../Bsp/Mp3/mp3.c</FilePath>
             </File>
+            <File>
+              <FileName>mp3_player.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Bsp/Mp3/mp3_player.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

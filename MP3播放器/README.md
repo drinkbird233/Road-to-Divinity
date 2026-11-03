@@ -13,7 +13,12 @@
 ## 状态
 
 - WAV / MP3 播放全链路已打通
-- 下一步：模块化（缓冲逻辑抽到 Bsp）、采样率自适应、FreeRTOS、选歌与 LVGL 界面
+- MP3 播放逻辑已模块化到 `Bsp/Mp3/mp3_player.c`，main 只负责初始化与轮询
+- 下一步：采样率自适应、FreeRTOS、选歌与 LVGL 界面
+
+## 模块接口
+
+`mp3_player_play(hi2s, path)` 打开文件、预装两个半区并启动 I2S DMA；`mp3_player_poll()` 在主循环中调用，返回 1 表示仍在播放；`mp3_player_stop()` 手动停止。I2S 半完成/完成回调也由该模块实现。
 
 ## 实现要点
 
