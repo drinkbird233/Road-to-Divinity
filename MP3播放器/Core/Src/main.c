@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "dma.h"
 #include "fatfs.h"
 #include "i2c.h"
@@ -51,11 +52,12 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static FRESULT res;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -74,7 +76,6 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 	uint8_t ret;
-	int8_t play_ret;
 
   /* USER CODE END 1 */
 
@@ -111,22 +112,19 @@ int main(void)
     es8388_hpvol_set(10);
     es8388_spkvol_set(0);
 
-    /* 2. 挂载 SD 卡 */
-    res = f_mount(&SDFatFS, SDPath, 1);
-    printf("mount = %d\r\n", res);
-    if (res != FR_OK) while (1);
+    
 
-    /* 3. 播放 MP3 */
-    play_ret = mp3_player_play(&hi2s2, "0:/TEST.MP3");
-    if (play_ret != MP3_PLAYER_OK) {
-        printf("mp3 play failed = %d\r\n", play_ret);
-    } else {
-        printf("playback started\r\n");
-        while (mp3_player_poll()) { }
-        printf("playback done\r\n");
-    }
-
+    
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -193,6 +191,28 @@ int fputc(int ch, FILE *f)
 }
 
 /* USER CODE END 4 */
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.

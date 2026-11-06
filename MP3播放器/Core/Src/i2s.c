@@ -71,7 +71,7 @@ void HAL_I2S_MspInit(I2S_HandleTypeDef* i2sHandle)
   /** Initializes the peripherals clock
   */
     PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2S;
-    PeriphClkInitStruct.PLLI2S.PLLI2SN = 192;
+    PeriphClkInitStruct.PLLI2S.PLLI2SN = 271;
     PeriphClkInitStruct.PLLI2S.PLLI2SR = 2;
     if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
     {
@@ -123,7 +123,7 @@ void HAL_I2S_MspInit(I2S_HandleTypeDef* i2sHandle)
     __HAL_LINKDMA(i2sHandle,hdmatx,hdma_spi2_tx);
 
     /* I2S2 interrupt Init */
-    HAL_NVIC_SetPriority(SPI2_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(SPI2_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(SPI2_IRQn);
   /* USER CODE BEGIN SPI2_MspInit 1 */
 

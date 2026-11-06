@@ -18,4 +18,12 @@ uint8_t mp3_player_poll(void);
 /* 手动停止（重复调用安全） */
 void mp3_player_stop(void);
 
+/* 暂停/恢复：只关 DMA 请求，I2S 不停，播放位置不丢 */
+void mp3_player_pause(void);
+void mp3_player_resume(void);
+uint8_t mp3_player_is_paused(void);
+
+/* 从头重播当前文件 */
+int8_t mp3_player_restart(void);
+
 #endif /* __MP3_PLAYER_H */

@@ -28,6 +28,8 @@ static int mp3_pos;                                     /* 下一个待解码字
 static uint8_t mp3_eof;                                 /* 文件已读完 */
 static uint8_t format_checked;                          /* 首帧格式已检查 */
 static uint8_t playing;
+static uint8_t paused;
+static char current_path[64];                           /* 重播用 */
 
 static volatile uint8_t half_flag;                      /* 前半区播完 */
 static volatile uint8_t full_flag;                      /* 后半区播完 */
@@ -125,6 +127,7 @@ int8_t mp3_player_play(I2S_HandleTypeDef *hi2s, const char *path)
 
     mp3_i2s = hi2s;
     playing = 0;
+    paused = 0;
     half_flag = 0;
     full_flag = 0;
     mp3_len = 0;
@@ -132,6 +135,9 @@ int8_t mp3_player_play(I2S_HandleTypeDef *hi2s, const char *path)
     mp3_eof = 0;
     format_checked = 0;
     mp3dec_init(&mp3d);
+
+    strncpy(current_path, path, sizeof(current_path) - 1);
+    current_path[sizeof(current_path) - 1] = '\0';
 
     if (f_open(&mp3_file, path, FA_READ) != FR_OK) {
         return MP3_PLAYER_ERR_OPEN;
@@ -182,6 +188,33 @@ void mp3_player_stop(void)
     HAL_I2S_DMAStop(mp3_i2s);
     f_close(&mp3_file);
     playing = 0;
+    paused = 0;
+}
+
+void mp3_player_pause(void)
+{
+    if (!playing || paused) return;
+    HAL_I2S_DMAPause(mp3_i2s);
+    paused = 1;
+}
+
+void mp3_player_resume(void)
+{
+    if (!playing || !paused) return;
+    HAL_I2S_DMAResume(mp3_i2s);
+    paused = 0;
+}
+
+uint8_t mp3_player_is_paused(void)
+{
+    return paused;
+}
+
+int8_t mp3_player_restart(void)
+{
+    if (!playing) return MP3_PLAYER_ERR_OPEN;
+    mp3_player_stop();
+    return mp3_player_play(mp3_i2s, current_path);
 }
 
 /* HAL 回调：只置标志，真正的解码放到主循环里做 */

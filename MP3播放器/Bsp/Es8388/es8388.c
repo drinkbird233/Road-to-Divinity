@@ -13,6 +13,44 @@ static I2C_HandleTypeDef *g_es8388_i2c = NULL;
 /* ES8388 的 7 位地址是 0x10，HAL 需要 8 位地址，左移一位 */
 #define ES8388_ADDR8  (ES8388_ADDR << 1)
 
+static void i2c_delay(void)
+{
+    for (volatile uint32_t i = 0; i < 200; i++) { }
+}
+
+/* I2C 总线被从机拉住 SDA 时，用 9 个时钟脉冲 + STOP 释放，再重新初始化外设 */
+static void es8388_i2c_recover(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    uint32_t i;
+
+    HAL_I2C_DeInit(g_es8388_i2c);
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    gpio.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+    for (i = 0; i < 9; i++) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+        i2c_delay();
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+        i2c_delay();
+    }
+    /* STOP：SCL 高时 SDA 由低变高 */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+    i2c_delay();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+    i2c_delay();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+    i2c_delay();
+
+    HAL_I2C_Init(g_es8388_i2c);
+}
+
 /**
  * @brief  写一个寄存器
  * @param  reg 寄存器地址
@@ -29,7 +67,13 @@ uint8_t es8388_write_reg(uint8_t reg, uint8_t val)
     if (HAL_I2C_Mem_Write(g_es8388_i2c, ES8388_ADDR8, reg,
                           I2C_MEMADD_SIZE_8BIT, &val, 1, 100) != HAL_OK)
     {
-        return 2;
+        es8388_i2c_recover();
+
+        if (HAL_I2C_Mem_Write(g_es8388_i2c, ES8388_ADDR8, reg,
+                              I2C_MEMADD_SIZE_8BIT, &val, 1, 100) != HAL_OK)
+        {
+            return 2;
+        }
     }
 
     return 0;
@@ -52,6 +96,8 @@ uint8_t es8388_read_reg(uint8_t reg)
     if (HAL_I2C_Mem_Read(g_es8388_i2c, ES8388_ADDR8, reg,
                          I2C_MEMADD_SIZE_8BIT, &val, 1, 100) != HAL_OK)
     {
+        /* 读失败同样做总线恢复，避免一次异常拖死后续所有操作 */
+        es8388_i2c_recover();
         return 0;
     }
 
