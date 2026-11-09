@@ -108,9 +108,9 @@ int main(void)
     ret = es8388_init(&hi2c1);
     printf("es8388 init = %d\r\n", ret);
     es8388_adda_cfg(1, 0);
-    es8388_output_cfg(1, 0);
+    es8388_output_cfg(1, 1);    /* 耳机通道 + 喇叭通道都打开 */
     es8388_hpvol_set(10);
-    es8388_spkvol_set(0);
+    es8388_spkvol_set(10);
 
     
 

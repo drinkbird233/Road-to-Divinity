@@ -25,6 +25,11 @@ static uint8_t key_read_mask(void)
     return m;
 }
 
+/*
+ * CubeMX 里也已经把 PE2/PE3/PE4 配成上拉输入、PA0 配成下拉输入，
+ * 这里再配一次是为了让 Bsp/Key 自包含：不依赖 CubeMX 的引脚配置，
+ * 单独移植到别的工程时也能工作。两边引脚定义要保持一致。
+ */
 void key_init(void)
 {
     GPIO_InitTypeDef gpio = {0};
@@ -73,4 +78,15 @@ uint8_t Key_Scan(void)
     if (pressed & WKUP_BIT) return WKUP_PRESS;
 
     return KEY_NONE;
+}
+
+uint8_t Key_IsDown(uint8_t key)
+{
+    switch (key) {
+    case KEY0_PRESS: return (stable_mask & KEY0_BIT) ? 1 : 0;
+    case KEY1_PRESS: return (stable_mask & KEY1_BIT) ? 1 : 0;
+    case KEY2_PRESS: return (stable_mask & KEY2_BIT) ? 1 : 0;
+    case WKUP_PRESS: return (stable_mask & WKUP_BIT) ? 1 : 0;
+    default:         return 0;
+    }
 }

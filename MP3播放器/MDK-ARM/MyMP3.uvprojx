@@ -336,7 +336,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F407xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Bsp/Es8388;../Bsp/Mp3;../Bsp/Key;../App/Key;../FATFS/Target;../FATFS/App;../Middlewares/Third_Party/FatFs/src;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/RVDS/ARM_CM4F</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Bsp/Es8388;../Bsp/Mp3;../Bsp/Key;../App/Key;../App/Player;../FATFS/Target;../FATFS/App;../Middlewares/Third_Party/FatFs/src;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/RVDS/ARM_CM4F</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -1469,6 +1469,21 @@
               <FileName>app_key.c</FileName>
               <FileType>1</FileType>
               <FilePath>../App/Key/app_key.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>App/Player</GroupName>
+          <Files>
+            <File>
+              <FileName>playlist.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Player/playlist.c</FilePath>
+            </File>
+            <File>
+              <FileName>settings.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../App/Player/settings.c</FilePath>
             </File>
           </Files>
         </Group>

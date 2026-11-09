@@ -12,4 +12,7 @@
 void key_init(void);
 uint8_t Key_Scan(void);
 
+/* 查询某个键当前是否仍按住（用于长按判断） */
+uint8_t Key_IsDown(uint8_t key);
+
 #endif
