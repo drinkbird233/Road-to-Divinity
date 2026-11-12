@@ -11,9 +11,6 @@
 #define MP3_BUF_BYTES         4096                      /* 压缩数据缓冲区大小 */
 #define MP3_FRAME_MAX         2400                      /* 单帧压缩数据最大字节数（留余量） */
 
-#define MP3_REQUIRED_HZ       44100                     /* 当前 I2S 固定配置 */
-#define MP3_REQUIRED_CHANNELS 2
-
 static I2S_HandleTypeDef *mp3_i2s;
 static FIL mp3_file;
 
@@ -26,7 +23,6 @@ static mp3dec_frame_info_t info;
 static int mp3_len;                                     /* 缓冲内有效字节数 */
 static int mp3_pos;                                     /* 下一个待解码字节位置 */
 static uint8_t mp3_eof;                                 /* 文件已读完 */
-static uint8_t format_checked;                          /* 首帧格式已检查 */
 static uint8_t playing;
 static uint8_t paused;
 static char current_path[64];                           /* 重播用 */
@@ -85,19 +81,20 @@ static uint8_t mp3_refill(uint8_t half)
                                       mp3_len - mp3_pos, pcm, &info);
 
         if (samples > 0) {
-            /* 首帧确认格式，当前 I2S 只支持 44.1k 立体声 */
-            if (!format_checked) {
-                format_checked = 1;
-                if (info.hz != MP3_REQUIRED_HZ ||
-                    info.channels != MP3_REQUIRED_CHANNELS) {
-                    memset(p + bytes_filled, 0,
-                           AUDIO_HALF_BYTES - bytes_filled);
-                    return 0;
+            uint8_t channels = (uint8_t)info.channels;
+            int i;
+
+            /* 单声道：原地从后往前展开成左右交错，I2S/ES8388 只收立体声 */
+            if (channels == 1) {
+                for (i = samples - 1; i >= 0; i--) {
+                    pcm[2 * i]     = pcm[i];
+                    pcm[2 * i + 1] = pcm[i];
                 }
+                channels = 2;
             }
 
-            /* samples 是每声道采样数，16bit 立体声所以要 ×4 */
-            uint32_t pcm_bytes = samples * info.channels * 2;
+            /* samples 是每声道采样数，16bit 所以要 ×2 字节 */
+            uint32_t pcm_bytes = samples * channels * 2;
 
             if (bytes_filled + pcm_bytes > AUDIO_HALF_BYTES) {
                 pcm_bytes = AUDIO_HALF_BYTES - bytes_filled;
@@ -121,6 +118,59 @@ static uint8_t mp3_refill(uint8_t half)
     return 1;
 }
 
+/* 采样率分两个 PLLI2S 家族，切换家族时才重配 PLL */
+#define I2S_FAMILY_NONE 0xFF
+static uint8_t i2s_family = I2S_FAMILY_NONE;
+
+static uint8_t audio_i2s_configure(uint32_t hz)
+{
+    uint8_t family;
+    uint32_t pll_n;
+    RCC_PeriphCLKInitTypeDef clk = {0};
+
+    switch (hz) {
+    case 44100:
+    case 22050:
+    case 11025:
+        family = 0;
+        break;
+    case 48000:
+    case 32000:
+    case 24000:
+    case 16000:
+    case 12000:
+    case 8000:
+        family = 1;
+        break;
+    default:
+        return 0;
+    }
+
+    /* 改时钟前必须先关 I2S */
+    __HAL_I2S_DISABLE(mp3_i2s);
+
+    if (family != i2s_family) {
+        pll_n = (family == 0) ? 271u : 344u;   /* 135.5MHz / 172MHz */
+
+        clk.PeriphClockSelection = RCC_PERIPHCLK_I2S;
+        clk.PLLI2S.PLLI2SN = pll_n;
+        clk.PLLI2S.PLLI2SR = 2;
+
+        if (HAL_RCCEx_PeriphCLKConfig(&clk) != HAL_OK) {
+            return 0;
+        }
+        i2s_family = family;
+    }
+
+    /* 让 HAL 按新时钟和采样率重新算 I2SDIV/ODD */
+    mp3_i2s->Init.AudioFreq = hz;
+    if (HAL_I2S_Init(mp3_i2s) != HAL_OK) {
+        return 0;
+    }
+
+    return 1;
+}
+
 int8_t mp3_player_play(I2S_HandleTypeDef *hi2s, const char *path)
 {
     if (hi2s == NULL || path == NULL) return MP3_PLAYER_ERR_OPEN;
@@ -133,7 +183,6 @@ int8_t mp3_player_play(I2S_HandleTypeDef *hi2s, const char *path)
     mp3_len = 0;
     mp3_pos = 0;
     mp3_eof = 0;
-    format_checked = 0;
     mp3dec_init(&mp3d);
 
     strncpy(current_path, path, sizeof(current_path) - 1);
@@ -145,6 +194,12 @@ int8_t mp3_player_play(I2S_HandleTypeDef *hi2s, const char *path)
 
     /* 预装两节车厢；任何一半装不出来（文件太短/格式不支持）都算失败 */
     if (!mp3_refill(0) || !mp3_refill(1)) {
+        f_close(&mp3_file);
+        return MP3_PLAYER_ERR_FORMAT;
+    }
+
+    /* 预装时已经解出首帧，按它配置 I2S 时钟 */
+    if (!audio_i2s_configure((uint32_t)info.hz)) {
         f_close(&mp3_file);
         return MP3_PLAYER_ERR_FORMAT;
     }
@@ -215,6 +270,16 @@ int8_t mp3_player_restart(void)
     if (!playing) return MP3_PLAYER_ERR_OPEN;
     mp3_player_stop();
     return mp3_player_play(mp3_i2s, current_path);
+}
+
+uint32_t mp3_player_sample_rate(void)
+{
+    return (uint32_t)info.hz;
+}
+
+uint8_t mp3_player_channels(void)
+{
+    return (uint8_t)info.channels;
 }
 
 /* HAL 回调：只置标志，真正的解码放到主循环里做 */

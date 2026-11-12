@@ -26,4 +26,8 @@ uint8_t mp3_player_is_paused(void);
 /* 从头重播当前文件 */
 int8_t mp3_player_restart(void);
 
+/* 当前曲目的音频格式（预装完成后有效） */
+uint32_t mp3_player_sample_rate(void);
+uint8_t mp3_player_channels(void);
+
 #endif /* __MP3_PLAYER_H */

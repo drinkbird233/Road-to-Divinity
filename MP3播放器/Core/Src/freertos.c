@@ -58,7 +58,7 @@ const osThreadAttr_t AudioTask_attributes = {
   .name = "AudioTask",
   .stack_size = 6144 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
-};
+};//音频任务
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -108,7 +108,7 @@ void MX_FREERTOS_Init(void) {
       .priority = (osPriority_t) osPriorityNormal,
     };
     (void)osThreadNew(app_key_task, NULL, &KeyTask_attributes);
-  }
+  }//按键任务
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -253,9 +253,11 @@ static uint8_t audio_play_index(uint8_t index)
         mp3_player_stop();              /* 关掉上一首，避免重复打开文件 */
         r = mp3_player_play(&hi2s2, path);
         if (r == MP3_PLAYER_OK) {
-            printf("AudioTask: track %u/%u %s\r\n",
+            printf("AudioTask: track %u/%u %s %luHz %uch\r\n",
                    (unsigned)(index + 1), (unsigned)total,
-                   playlist_name(index));
+                   playlist_name(index),
+                   (unsigned long)mp3_player_sample_rate(),
+                   (unsigned)mp3_player_channels());
             settings_store();
             return 1;
         }
