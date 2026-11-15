@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -90,7 +91,21 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
+  {
+    uint32_t cfsr = SCB->CFSR;
+    uint32_t hfsr = SCB->HFSR;
+    uint32_t bfar = SCB->BFAR;
+    uint32_t mmfar = SCB->MMFAR;
+    uint32_t msp = __get_MSP();
+    uint32_t psp = __get_PSP();
+    uint32_t mpc = ((uint32_t *)msp)[6];
+    uint32_t ppc = psp ? ((uint32_t *)psp)[6] : 0;
 
+    printf("HARDFAULT CFSR=%08lX HFSR=%08lX BFAR=%08lX MMFAR=%08lX MSP_PC=%08lX PSP_PC=%08lX\r\n",
+           (unsigned long)cfsr, (unsigned long)hfsr,
+           (unsigned long)bfar, (unsigned long)mmfar,
+           (unsigned long)mpc, (unsigned long)ppc);
+  }
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {

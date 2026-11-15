@@ -12,20 +12,25 @@
 - 四键控制：KEY0 播放/暂停；KEY1/KEY2 短按音量±、长按 600ms 上一首/下一首；WK_UP 重播
 - 上电记忆：音量档位与当前曲目存内部 Flash，断电保持
 - 采样率自适应：8k / 11.025k / 12k / 16k / 22.05k / 24k / 32k / 44.1k / 48k；单声道自动复制为立体声
+- LVGL 9.4 音乐播放器界面（320×240 横屏）：音乐库、播放详情、播放模式、设置页
+- XPT2046 电阻触摸，二维仿射校准；UI 点歌、播放/暂停、上下曲、模式、音量、重扫均控制真实播放器
 - USART1 115200 调试输出；PF8 蜂鸣器、PF9/PF10 LED
 
 ## 状态
 
-- WAV / MP3 播放全链路已打通，FreeRTOS 下真机播放正常
-- 双任务、播放列表、长按切歌、双通道输出、Flash 记忆、采样率/声道自适应均已完成
-- 下一步：LVGL/LCD 界面，或单曲循环/随机等播放模式
+- MP3 播放、播放列表、采样率/声道自适应、Flash 记忆、LVGL UI 与触摸均已完成
+- 待完善：进度条 seek、耳机/喇叭切换、亮度调节、屏幕休眠
+- 下一步：完善上述设置项，再考虑歌词/频谱等扩展
 
 ## 模块接口
 
-- `Bsp/Mp3/mp3_player.c`：`play / poll / stop / pause / resume / is_paused / restart`
+- `Bsp/Mp3/mp3_player.c`：`play / poll / stop / pause / resume / is_paused / restart`，以及采样率、位置、时长查询
 - `App/Key/app_key.c`：KeyTask、命令队列、音量控制
-- `App/Player/playlist.c`：根目录 MP3 扫描、排序、上下曲
+- `App/Player/playlist.c`：根目录 MP3 扫描、排序、上下曲、播放模式
 - `App/Player/settings.c`：Flash Sector 11 追加日志，保存音量与曲目索引
+- `App/Player/player_adapter.c`：把参考 UI 的 `player_send / player_get_snapshot` 映射到现有播放器
+- `Bsp/Touch/xpt2046.c`：XPT2046 软件 SPI 与仿射校准
+- `App/Ui/`：LVGL 9.4 界面（Generated/Controller/Port/Assets）
 
 ## 实现要点
 
@@ -38,12 +43,20 @@
 - 设置保存在 Flash `0x080E0000` 起的 Sector 11，每条 16 字节，约 8000 条后上电时擦除；要求程序 < 0xE0000
 - 采样率自适应：44.1k 家族（44100/22050/11025）用 PLLI2S 271/2=135.5MHz；48k 家族（48000/32000/24000/16000/12000/8000）用 344/2=172MHz；切家族时重配 PLL，再让 HAL 重算 I2SDIV/ODD。ES8388 的 MCLK/fs 固定 256，无需改寄存器
 - 单声道在 `mp3_refill` 中原地倒序展开为左右交错（`pcm[2i]=pcm[2i+1]=pcm[i]`）
-- 限制：FatFs `_USE_LFN=0`，仅支持 8.3 短文件名；播放列表最多 32 首；长按切歌一次只跳一首
+- LVGL 9.4，堆 48KB 放在 CCM `0x10000000`（`LV_MEM_ADR`），显示缓冲 320×16 行在主 SRAM；LVGL UI 任务 8KB 栈
+- 屏幕通过 FSMC 以横屏 320×240 驱动（MADCTL 0x68），LVGL `flush_cb` 直接调用 `lcd_flush_area`
+- 触摸 XPT2046 软件 SPI（SCK PB0 / MISO PB2 / MOSI PF11 / CS PC13 / PEN PB1），四角采样后拟合二维仿射系数，中心点误差 < 2px
+- UI 命令通过 `key_cmd_t` 队列进入 AudioTask，与按键共用同一条控制路径
+- 进度由 mp3_player 统计已播放帧数和文件大小/码率估算时长；VBR 文件进度为近似值
+- ARMCC 5 不识别 UTF-8 源码，UI 中的中文已转换为八进制转义，运行时仍为 UTF-8
+- 限制：FatFs `_USE_LFN=0`，仅支持 8.3 短文件名；播放列表最多 32 首；长按切歌一次只跳一首；seek/亮度/输出切换/休眠暂未实现
 
 ## 硬件
 
 - MCU：STM32F407ZGT6（探索者 V3，HSE 8MHz，168MHz）
 - 音频：ES8388；I2C1 SCL PB8 / SDA PB9；I2S2 LRCK PB12 / SCLK PB13 / SD PC3 / MCLK PC6
+- 显示：2.8 寸 240×320 ST7789，FSMC NE4/A6，CS PG12 / RS PF12 / WR PD5 / RD PD4 / BL PB15
+- 触摸：XPT2046 软件 SPI，SCK PB0 / MISO PB2 / MOSI PF11 / CS PC13 / PEN PB1
 - 存储：SDIO PC8-PC12 + PD2
 - 调试：USART1 115200
 

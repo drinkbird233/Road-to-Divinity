@@ -25,6 +25,9 @@ static int mp3_pos;                                     /* 下一个待解码字
 static uint8_t mp3_eof;                                 /* 文件已读完 */
 static uint8_t playing;
 static uint8_t paused;
+static uint32_t file_bytes;
+static uint32_t played_frames;
+static uint32_t duration_ms;
 static char current_path[64];                           /* 重播用 */
 
 static volatile uint8_t half_flag;                      /* 前半区播完 */
@@ -188,14 +191,24 @@ int8_t mp3_player_play(I2S_HandleTypeDef *hi2s, const char *path)
     strncpy(current_path, path, sizeof(current_path) - 1);
     current_path[sizeof(current_path) - 1] = '\0';
 
+    played_frames = 0;
+    duration_ms = 0;
+    file_bytes = 0;
+
     if (f_open(&mp3_file, path, FA_READ) != FR_OK) {
         return MP3_PLAYER_ERR_OPEN;
     }
+    file_bytes = (uint32_t)f_size(&mp3_file);
 
     /* 预装两节车厢；任何一半装不出来（文件太短/格式不支持）都算失败 */
     if (!mp3_refill(0) || !mp3_refill(1)) {
         f_close(&mp3_file);
         return MP3_PLAYER_ERR_FORMAT;
+    }
+
+    if (info.bitrate_kbps > 0) {
+        /* bytes * 8 / kbps 得到毫秒 */
+        duration_ms = file_bytes * 8u / (uint32_t)info.bitrate_kbps;
     }
 
     /* 预装时已经解出首帧，按它配置 I2S 时钟 */
@@ -222,6 +235,7 @@ uint8_t mp3_player_poll(void)
 
     if (half_flag) {
         half_flag = 0;
+        played_frames += AUDIO_HALF_BYTES / 4u;
         if (!mp3_refill(0)) {
             mp3_player_stop();
             return 0;
@@ -229,6 +243,7 @@ uint8_t mp3_player_poll(void)
     }
     if (full_flag) {
         full_flag = 0;
+        played_frames += AUDIO_HALF_BYTES / 4u;
         if (!mp3_refill(1)) {
             mp3_player_stop();
             return 0;
@@ -280,6 +295,22 @@ uint32_t mp3_player_sample_rate(void)
 uint8_t mp3_player_channels(void)
 {
     return (uint8_t)info.channels;
+}
+
+uint8_t mp3_player_is_playing(void)
+{
+    return playing;
+}
+
+uint32_t mp3_player_position_ms(void)
+{
+    if (info.hz <= 0) return 0;
+    return played_frames * 1000u / (uint32_t)info.hz;
+}
+
+uint32_t mp3_player_duration_ms(void)
+{
+    return duration_ms;
 }
 
 /* HAL 回调：只置标志，真正的解码放到主循环里做 */

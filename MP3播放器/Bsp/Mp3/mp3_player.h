@@ -30,4 +30,9 @@ int8_t mp3_player_restart(void);
 uint32_t mp3_player_sample_rate(void);
 uint8_t mp3_player_channels(void);
 
+/* 播放状态与进度（供 UI 使用） */
+uint8_t mp3_player_is_playing(void);
+uint32_t mp3_player_position_ms(void);
+uint32_t mp3_player_duration_ms(void);
+
 #endif /* __MP3_PLAYER_H */

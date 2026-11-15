@@ -31,6 +31,7 @@
 #include "app_key.h"
 #include "playlist.h"
 #include "settings.h"
+#include "lvgl_port.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -58,12 +59,13 @@ const osThreadAttr_t AudioTask_attributes = {
   .name = "AudioTask",
   .stack_size = 6144 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
-};//音频任务
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 static uint8_t audio_play_index(uint8_t index);
 static void settings_store(void);
+static void playlist_rescan(void);
 /* USER CODE END FunctionPrototypes */
 
 void StartAudioTask(void *argument);
@@ -109,6 +111,11 @@ void MX_FREERTOS_Init(void) {
     };
     (void)osThreadNew(app_key_task, NULL, &KeyTask_attributes);
   }//按键任务
+
+  {
+    /* 参考工程的 LVGL 9 端口会创建 lvgl_ui 任务 */
+    (void)lvgl_port_start();
+  }//LVGL 界面任务
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -128,10 +135,13 @@ void StartAudioTask(void *argument)
 {
   /* USER CODE BEGIN StartAudioTask */
     FRESULT res;
+    key_cmd_t msg;
     uint8_t cmd;
     uint8_t started = 0;
     uint8_t saved_vol;
     uint8_t saved_track;
+    uint8_t settings_dirty = 0;
+    uint32_t settings_tick = 0;
 
     (void)argument;
 
@@ -165,9 +175,21 @@ void StartAudioTask(void *argument)
 
     for (;;)
     {
+        /* 音量改动延迟保存，避免滑块拖动时反复写 Flash 卡音频 */
+        if (started && settings_dirty &&
+            (HAL_GetTick() - settings_tick > 500)) {
+            settings_store();
+            settings_dirty = 0;
+        }
+
         /* 3. 待机：阻塞等命令，不占 CPU */
         if (!started) {
-            if (!app_key_wait_cmd(0xFFFFFFFFu, &cmd)) continue;
+            if (settings_dirty) {
+                settings_store();
+                settings_dirty = 0;
+            }
+            if (!app_key_wait_cmd(0xFFFFFFFFu, &msg)) continue;
+            cmd = msg.cmd;
 
             if (cmd == KEY_CMD_TOGGLE_PLAY || cmd == KEY_CMD_REPLAY) {
                 if (playlist_count() > 0) {
@@ -181,10 +203,27 @@ void StartAudioTask(void *argument)
                 started = audio_play_index(playlist_prev());
             } else if (cmd == KEY_CMD_VOL_UP) {
                 app_key_volume_up();
-                settings_store();
+                settings_dirty = 1;
+                settings_tick = HAL_GetTick();
             } else if (cmd == KEY_CMD_VOL_DOWN) {
                 app_key_volume_down();
-                settings_store();
+                settings_dirty = 1;
+                settings_tick = HAL_GetTick();
+            } else if (cmd == KEY_CMD_MODE) {
+                playlist_mode_cycle();
+                printf("AudioTask: mode = %s\r\n", playlist_mode_name());
+            } else if (cmd == KEY_CMD_SELECT) {
+                playlist_set_current((uint8_t)msg.value);
+                started = audio_play_index(playlist_current());
+            } else if (cmd == KEY_CMD_SET_MODE) {
+                playlist_set_mode((uint8_t)msg.value);
+                printf("AudioTask: mode = %s\r\n", playlist_mode_name());
+            } else if (cmd == KEY_CMD_SET_VOLUME) {
+                app_key_volume_set((uint8_t)msg.value);
+                settings_dirty = 1;
+                settings_tick = HAL_GetTick();
+            } else if (cmd == KEY_CMD_RESCAN) {
+                playlist_rescan();
             }
             continue;
         }
@@ -192,13 +231,14 @@ void StartAudioTask(void *argument)
         /* 4. 播放中：喂数据 */
         if (!mp3_player_poll()) {
             printf("AudioTask: Playback done\r\n");
-            /* 自动下一首，播完一圈回到第一首 */
-            started = audio_play_index(playlist_next());
+            /* 按当前播放模式决定下一首 */
+            started = audio_play_index(playlist_advance());
             continue;
         }
 
         /* 5. 顺手处理命令，最多等 5ms，保证喂数据节奏 */
-        if (app_key_wait_cmd(5, &cmd)) {
+        if (app_key_wait_cmd(5, &msg)) {
+            cmd = msg.cmd;
             if (cmd == KEY_CMD_TOGGLE_PLAY) {
                 if (mp3_player_is_paused()) {
                     mp3_player_resume();
@@ -215,10 +255,27 @@ void StartAudioTask(void *argument)
                 started = audio_play_index(playlist_prev());
             } else if (cmd == KEY_CMD_VOL_UP) {
                 app_key_volume_up();
-                settings_store();
+                settings_dirty = 1;
+                settings_tick = HAL_GetTick();
             } else if (cmd == KEY_CMD_VOL_DOWN) {
                 app_key_volume_down();
-                settings_store();
+                settings_dirty = 1;
+                settings_tick = HAL_GetTick();
+            } else if (cmd == KEY_CMD_MODE) {
+                playlist_mode_cycle();
+                printf("AudioTask: mode = %s\r\n", playlist_mode_name());
+            } else if (cmd == KEY_CMD_SELECT) {
+                playlist_set_current((uint8_t)msg.value);
+                started = audio_play_index(playlist_current());
+            } else if (cmd == KEY_CMD_SET_MODE) {
+                playlist_set_mode((uint8_t)msg.value);
+                printf("AudioTask: mode = %s\r\n", playlist_mode_name());
+            } else if (cmd == KEY_CMD_SET_VOLUME) {
+                app_key_volume_set((uint8_t)msg.value);
+                settings_dirty = 1;
+                settings_tick = HAL_GetTick();
+            } else if (cmd == KEY_CMD_RESCAN) {
+                playlist_rescan();
             }
         } else {
             osDelay(1);
@@ -233,6 +290,16 @@ static void settings_store(void)
 {
     if (!settings_save(app_key_volume_get(), playlist_current())) {
         printf("AudioTask: settings save failed\r\n");
+    }
+}
+
+static void playlist_rescan(void)
+{
+    uint8_t n = playlist_scan();
+
+    printf("AudioTask: rescan = %u\r\n", (unsigned)n);
+    if (n > 0 && playlist_current() >= n) {
+        playlist_set_current(0);
     }
 }
 
@@ -269,6 +336,14 @@ static uint8_t audio_play_index(uint8_t index)
 
     printf("AudioTask: no playable track\r\n");
     return 0;
+}
+
+/* FreeRTOS 检测到任务栈溢出时调用 */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    printf("STACK OVERFLOW: %s\r\n", pcTaskName);
+    while (1) { }
 }
 /* USER CODE END Application */
 

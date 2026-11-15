@@ -26,12 +26,14 @@
 #include "sdio.h"
 #include "usart.h"
 #include "gpio.h"
+#include "fsmc.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "es8388.h"
 #include "mp3_player.h"
+#include "lcd.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -103,7 +105,11 @@ int main(void)
   MX_I2S2_Init();
   MX_SDIO_SD_Init();
   MX_FATFS_Init();
+  MX_FSMC_Init();
   /* USER CODE BEGIN 2 */
+    /* 打开 CCM 时钟，GUI 任务栈和 LVGL 堆都在 CCM 里 */
+    RCC->AHB1ENR |= RCC_AHB1ENR_CCMDATARAMEN;
+
     /* 1. ES8388 初始化 */
     ret = es8388_init(&hi2c1);
     printf("es8388 init = %d\r\n", ret);
@@ -112,9 +118,9 @@ int main(void)
     es8388_hpvol_set(10);
     es8388_spkvol_set(10);
 
-    
+    /* 2. LCD：FSMC 初始化、读 ID、面板初始化 */
+    lcd_init();
 
-    
   /* USER CODE END 2 */
 
   /* Init scheduler */

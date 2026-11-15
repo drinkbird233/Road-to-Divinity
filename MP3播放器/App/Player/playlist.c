@@ -1,5 +1,6 @@
 #include "playlist.h"
 #include "fatfs.h"
+#include "main.h"
 #include <string.h>
 
 #define PLAYLIST_MAX 32
@@ -7,6 +8,9 @@
 static char names[PLAYLIST_MAX][13];   /* 8.3 文件名 + '\0' */
 static uint8_t count;
 static uint8_t current;
+static uint8_t mode = PLAYLIST_MODE_SEQ;
+static uint8_t version = 1;
+static uint32_t rng;
 
 static uint8_t is_mp3(const char *name)
 {
@@ -30,6 +34,7 @@ uint8_t playlist_scan(void)
 
     count = 0;
     current = 0;
+    version++;
 
     if (f_opendir(&dir, "0:/") == FR_OK) {
         while (count < PLAYLIST_MAX &&
@@ -105,4 +110,67 @@ void playlist_path(uint8_t index, char *buf, uint16_t size)
     strncpy(buf, "0:/", size - 1);
     buf[size - 1] = '\0';
     strncat(buf, names[index], size - strlen(buf) - 1);
+}
+
+uint8_t playlist_mode(void)
+{
+    return mode;
+}
+
+uint8_t playlist_mode_cycle(void)
+{
+    mode = (uint8_t)((mode + 1) % 3);
+    return mode;
+}
+
+void playlist_set_mode(uint8_t value)
+{
+    if (value < 3) mode = value;
+}
+
+uint8_t playlist_version(void)
+{
+    return version;
+}
+
+const char *playlist_mode_name(void)
+{
+    switch (mode) {
+    case PLAYLIST_MODE_SINGLE:  return "SINGLE";
+    case PLAYLIST_MODE_SHUFFLE: return "SHUFFLE";
+    default:                    return "SEQUENCE";
+    }
+}
+
+static uint8_t random_index(uint8_t exclude)
+{
+    uint8_t index;
+
+    if (rng == 0) {
+        rng = HAL_GetTick() ^ 0x9E3779B9u;
+    }
+    rng ^= rng << 13;
+    rng ^= rng >> 17;
+    rng ^= rng << 5;
+
+    index = (uint8_t)(rng % count);
+    if (count > 1 && index == exclude) {
+        index = (uint8_t)((index + 1) % count);
+    }
+    return index;
+}
+
+uint8_t playlist_advance(void)
+{
+    if (count == 0) return 0;
+
+    switch (mode) {
+    case PLAYLIST_MODE_SINGLE:
+        return current;
+    case PLAYLIST_MODE_SHUFFLE:
+        current = random_index(current);
+        return current;
+    default:
+        return playlist_next();
+    }
 }
