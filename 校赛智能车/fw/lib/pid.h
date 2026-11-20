@@ -11,6 +11,8 @@ typedef struct {
     float kp, ki, kd;
     float i_lim;        /* 积分项限幅（输出单位） */
     float out_min, out_max;
+    float i_band;       /* 积分分离带：|err| > i_band 时暂停积分（0 = 不启用）。
+                         * 用来抑制阶跃跟踪时的积分饱和（windup）超调。 */
     float d_lpf_hz;     /* 微分低通截止频率 */
     float i_acc;        /* 积分累加器 */
     float d_filt;       /* 微分滤波状态 */

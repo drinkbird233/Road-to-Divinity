@@ -555,6 +555,15 @@ static void cli_exec(void)
         app_log("[cli] TIM1 CR1=%04X CCER=%04X CCR1=%u CCR2=%u\r\n",
                 (unsigned)TIM1->CR1, (unsigned)TIM1->CCER,
                 (unsigned)TIM1->CCR1, (unsigned)TIM1->CCR2);
+        /* 速度环 PID 内部状态：i_acc 是关键，若稳态有误差但它不涨 = 积分被卡住 */
+        app_log("[cli] pid iaccL=%d iaccR=%d ilim=%d\r\n",
+                (int)ctrl_pid_iacc_l(), (int)ctrl_pid_iacc_r(),
+                (int)ctrl_pid_ilim_l());
+        {
+            char pb[96];
+            ctrl_pid_dump_l(pb, (int)sizeof(pb));
+            app_log("[cli] %s\r\n", pb);
+        }
         break;
 
     default:

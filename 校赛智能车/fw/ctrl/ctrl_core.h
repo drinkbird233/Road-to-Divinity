@@ -44,4 +44,10 @@ uint8_t ctrl_hold_active(void);
 /* 运行时改速度环增益（会同步到 PID 对象） */
 void  ctrl_set_speed_gains(float kp, float ki, float ff);
 
+/* 台架诊断：速度环 PID 的内部状态 */
+float ctrl_pid_iacc_l(void);
+float ctrl_pid_iacc_r(void);
+float ctrl_pid_ilim_l(void);
+void  ctrl_pid_dump_l(char *b, int n);
+
 #endif /* CTRL_CORE_H */

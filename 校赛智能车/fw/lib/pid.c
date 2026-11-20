@@ -2,6 +2,7 @@
  * @file  pid.c
  */
 #include "pid.h"
+#include <math.h>
 
 void pid_init(pid_t *p, float kp, float ki, float kd, float out_min, float out_max)
 {
@@ -11,6 +12,7 @@ void pid_init(pid_t *p, float kp, float ki, float kd, float out_min, float out_m
     p->i_lim = (out_max - out_min) * 0.3f;
     p->out_min = out_min;
     p->out_max = out_max;
+    p->i_band = 0.0f;        /* 0 = 积分分离关闭 */
     p->d_lpf_hz = 0.0f;      /* 0 = 不滤波 */
     p->i_acc = 0.0f;
     p->d_filt = 0.0f;
@@ -57,11 +59,14 @@ float pid_step(pid_t *p, float ref, float meas, float dt)
 
     out = p->kp * err + p->i_acc + p->kd * d_raw;
 
-    /* 条件积分 */
+    /* 条件积分 + 积分分离：
+     * 输出饱和时不再往饱和方向积分（抗饱和），
+     * 误差超过 i_band 时暂停积分（抑制阶跃跟踪时的 windup 超调）。 */
     {
         int sat_hi = (out >= p->out_max) && (err > 0.0f);
         int sat_lo = (out <= p->out_min) && (err < 0.0f);
-        if (!sat_hi && !sat_lo && p->ki > 0.0f) {
+        int in_band = (p->i_band <= 0.0f) || (fabsf(err) <= p->i_band);
+        if (!sat_hi && !sat_lo && in_band && p->ki > 0.0f) {
             float trial = p->i_acc + p->ki * err * dt;
             p->i_acc = clampf(trial, -p->i_lim, p->i_lim);
             out = p->kp * err + p->i_acc + p->kd * d_raw;

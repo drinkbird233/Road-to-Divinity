@@ -49,9 +49,10 @@
 #define CFG_V_MAX               1000.0f
 
 /* ======================= 速度环（内环�?======================= */
-#define CFG_SPEED_FF            10.40f /* feedforward: duty per mm/s. measured 2650 duty -> 253 mm/s => 10.47 */
+#define CFG_SPEED_FF            9.00f  /* feedforward: duty per mm/s. measured steady duty 2685 at 300 mm/s => 8.95 */
 #define CFG_SPEED_KP            8.00f  /* P: measured 6.0 was too soft */
 #define CFG_SPEED_KI            80.0f  /* I: with correct FF it only trims */
+#define CFG_SPEED_I_BAND        30.0f /* integral separation: pause I when |err| > this (mm/s), kills windup overshoot */
 #define CFG_SPEED_I_LIM         2500.0f
 #define CFG_SPEED_LPF_HZ        30.0f /* 速度测量低�?*/
 

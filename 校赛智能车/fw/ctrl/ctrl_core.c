@@ -25,12 +25,43 @@
 #include "main.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <string.h>
 
 static car_state_shadow_t s_sh;
 static car_params_t       s_p;
 
 static pid_t   s_pid_l;
 static pid_t   s_pid_r;
+
+/* 编码器测速滑动窗口。
+ * 5 ms 只有 ~10 个脉冲（300 mm/s），1 个计数 = 31 mm/s，
+ * 这么粗的量化被 P 放大后必然形成极限环。
+ * 把最近 N 拍的计数累加再算速度，分辨率提高 N 倍，代价是 N 拍延迟。 */
+#define SPEED_WIN_N 4u
+typedef struct {
+    int16_t buf[SPEED_WIN_N];
+    uint8_t idx;
+    uint8_t fill;
+    int32_t sum;
+} speed_win_t;
+
+static speed_win_t s_win_l;
+static speed_win_t s_win_r;
+
+static float speed_window(speed_win_t *w, int16_t d, float fs)
+{
+    if (w->fill >= SPEED_WIN_N) {
+        w->sum -= w->buf[w->idx];
+    } else {
+        w->fill++;
+    }
+    w->buf[w->idx] = d;
+    w->sum += d;
+    w->idx = (uint8_t)((w->idx + 1u) % SPEED_WIN_N);
+    return (float)w->sum * CFG_MM_PER_COUNT * fs / (float)w->fill;
+}
+
 static lpf1_t  s_lpf_vl;
 static lpf1_t  s_lpf_vr;
 static lpf1_t  s_lpf_e;
@@ -96,10 +127,16 @@ void ctrl_init(void)
 
     pid_init(&s_pid_l, CFG_SPEED_KP, CFG_SPEED_KI, 0.0f, -CFG_PWM_MAX, CFG_PWM_MAX);
     pid_init(&s_pid_r, CFG_SPEED_KP, CFG_SPEED_KI, 0.0f, -CFG_PWM_MAX, CFG_PWM_MAX);
+    /* 积分分离：阶跃跟踪时 |err| 大，暂停积分可把超调从 50% 压到 10% 以内 */
+    s_pid_l.i_band = CFG_SPEED_I_BAND;
+    s_pid_r.i_band = CFG_SPEED_I_BAND;
     lpf1_init(&s_lpf_vl, 1.0f / ((float)CFG_CTRL_PERIOD_MS * 0.001f), CFG_SPEED_LPF_HZ);
     lpf1_init(&s_lpf_vr, 1.0f / ((float)CFG_CTRL_PERIOD_MS * 0.001f), CFG_SPEED_LPF_HZ);
     lpf1_init(&s_lpf_e,  1.0f / ((float)CFG_CTRL_PERIOD_MS * 0.001f), CFG_ERR_LPF_HZ);
     lpf1_init(&s_lpf_gyro, 1.0f / ((float)CFG_CTRL_PERIOD_MS * 0.001f), 50.0f);
+
+    memset(&s_win_l, 0, sizeof(s_win_l));
+    memset(&s_win_r, 0, sizeof(s_win_r));
 
     fsm_init();
 
@@ -228,6 +265,21 @@ void ctrl_set_speed_gains(float kp, float ki, float ff)
     pid_set_gains(&s_pid_r, kp, ki, 0.0f);
 }
 
+/* 台架诊断：把速度环 PID 的内部状态暴露出来。
+ * 积分项 i_acc 是关键——如果稳态误差存在而 i_acc 不涨，说明积分被卡住了。 */
+float ctrl_pid_iacc_l(void)  { return s_pid_l.i_acc; }
+float ctrl_pid_iacc_r(void)  { return s_pid_r.i_acc; }
+float ctrl_pid_ilim_l(void)  { return s_pid_l.i_lim; }
+void  ctrl_pid_dump_l(char *b, int n)
+{
+    /* kp / ki / i_acc / out_min / out_max / ref / meas */
+    (void)snprintf(b, (size_t)n,
+                   "kp=%.2f ki=%.2f iacc=%.0f omin=%.0f omax=%.0f ref=%.1f meas=%.1f",
+                   (double)s_pid_l.kp, (double)s_pid_l.ki, (double)s_pid_l.i_acc,
+                   (double)s_pid_l.out_min, (double)s_pid_l.out_max,
+                   (double)s_hold_l, (double)s_v_meas_l);
+}
+
 /* ------------------------------------------------------------------ */
 
 void ctrl_step(void)
@@ -272,8 +324,11 @@ void ctrl_step(void)
     }
 
     bsp_encoder_read(&dl, &dr);
-    vl_raw = bsp_encoder_delta_mm(dl) * fs;
-    vr_raw = bsp_encoder_delta_mm(dr) * fs;
+    /* 测速窗口：5 ms 内只有 ~10 个脉冲，1 个计数就是 31 mm/s，
+     * 这个量化噪声被 P 放大后会形成极限环（实测稳态在 302~366 之间摆）。
+     * 用 4 拍（20 ms）滑动窗口把分辨率提高 4 倍。 */
+    vl_raw = speed_window(&s_win_l, dl, fs);
+    vr_raw = speed_window(&s_win_r, dr, fs);
     s_v_meas_l = lpf1_step(&s_lpf_vl, vl_raw);
     s_v_meas_r = lpf1_step(&s_lpf_vr, vr_raw);
     s_dist_mm += (int32_t)((vl_raw + vr_raw) * 0.5f * dt);

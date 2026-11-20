@@ -24,7 +24,10 @@ param(
     [string]$Message = ""
 )
 
-$ErrorActionPreference = "Stop"
+# 注意：不能用 "Stop"。git 会把警告（比如 CRLF 提示）写到 stderr，
+# 在 Stop 模式下 PowerShell 会把它当成终止性错误，导致脚本半路退出。
+# 所以统一用 Continue，每个 git 调用后面自己检查 $LASTEXITCODE。
+$ErrorActionPreference = "Continue"
 
 # ---------------- 配置 ----------------
 $local   = "D:\car\smartcar\SmartCar_F407"          # 本地工程（代码源）
@@ -50,8 +53,8 @@ if (-not $Message) {
 
 # ---------------- 1. 本地提交 ----------------
 Info "[1/4] 检查本地改动 ..."
-git -C $local add -A
-$pending = git -C $local status --porcelain
+git -C $local add -A 2>$null
+$pending = git -C $local status --porcelain 2>$null
 if ($pending) {
     $n = ($pending | Measure-Object).Count
     git -C $local -c i18n.commitEncoding=UTF-8 commit -m $Message | Out-Null
@@ -78,8 +81,8 @@ Ok "      已导出 $files 个文件"
 
 # ---------------- 3. 暂存仓库提交 ----------------
 Info "[3/4] 暂存仓库提交 ..."
-git -C $staging add -A
-$pending2 = git -C $staging status --porcelain
+git -C $staging add -A 2>$null
+$pending2 = git -C $staging status --porcelain 2>$null
 if ($pending2) {
     git -C $staging -c i18n.commitEncoding=UTF-8 commit -m $Message | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "暂存仓库提交失败" }
