@@ -49,6 +49,11 @@ static const loop_cfg_t s_loop_tbl[2] = {
 };
 
 static fsm_out_t s_o;
+
+/* 运行时可调的直道 / 弯道目标速度（串口 c 命令修改，不用重新编译） */
+static float     s_v_straight = CFG_V_STRAIGHT;
+static float     s_v_corner   = CFG_V_CORNER;
+
 static uint32_t  s_t_enter;
 static int32_t   s_d_enter;      /* 进入状态时的里程 */
 static int32_t   s_d_blind;      /* 进入盲走时的里程 */
@@ -210,7 +215,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
         s_o.e_bias   = 0.0f;
         s_o.kp_scale = 1.0f;
         s_o.yaw_hold = 1u;
-        set_speed_target(CFG_V_STRAIGHT);
+        set_speed_target(s_v_straight);
 
         if (!trk) break;
 
@@ -328,7 +333,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
         s_o.e_bias   = 0.0f;
         s_o.yaw_hold = 1u;
         s_o.kp_scale = 1.0f;
-        set_speed_target(CFG_V_CORNER);
+        set_speed_target(s_v_corner);
         if (line && absf(err) < FSM_CENTER_ERR) {
             if (++s_relock >= FSM_RELOCK_CYCLES) {
                 /* 一个环岛结束 → 下一个环岛按另一种类型处理（本图只有一个圆 + 一个六边形） */
@@ -351,7 +356,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
         /* 盲走：屏蔽 8 路位置项，靠 IMU 保持进线前的航向 */
         s_o.yaw_hold = 1u;
         s_o.kp_scale = 0.0f;
-        set_speed_target(CFG_V_CORNER);
+        set_speed_target(s_v_corner);
         if ((dist_mm - s_d_enter) > FSM_CROSS_BLIND_MM) {
             enter(EL_STRAIGHT, dist_mm, yaw, tick_ms);
         }
@@ -360,7 +365,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
     case EL_CORNER:
         s_o.kp_scale = 1.2f;                   /* 弯道宁可多打一点 */
         s_o.yaw_hold = 0u;
-        set_speed_target(CFG_V_CORNER);
+        set_speed_target(s_v_corner);
         if (line && absf(err) < FSM_CENTER_ERR) {
             if (s_hold_since == 0u) s_hold_since = tick_ms;
             if (tick_ms - s_hold_since >= FSM_CENTER_HOLD_MS) {
@@ -398,4 +403,18 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
      *   if (!in_window(dist_mm, EL_LOOP, 150)) 不允许进入环岛，
      * 用来把"环岛入口误判"和"盲走区误判"压到接近 0。
      * 现在先只用时间和传感器特征，因为里程标定要在实车上做。 */
+}
+
+/* ---------------- 运行时速度目标 ---------------- */
+
+void fsm_set_speeds(float v_straight, float v_corner)
+{
+    if (v_straight > 0.0f) s_v_straight = v_straight;
+    if (v_corner   > 0.0f) s_v_corner   = v_corner;
+}
+
+void fsm_get_speeds(float *v_straight, float *v_corner)
+{
+    if (v_straight) *v_straight = s_v_straight;
+    if (v_corner)   *v_corner   = s_v_corner;
 }

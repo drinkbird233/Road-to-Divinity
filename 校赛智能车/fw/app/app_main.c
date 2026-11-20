@@ -221,6 +221,7 @@ static uint8_t s_cli_seen;      /* 收到过至少一条命令后置位，用于
 static uint32_t s_cli_ms;       /* 最后一次收到字节的时刻 */
 static uint8_t s_watch;         /* w 命令：编码器/速度连续监控 */
 static uint8_t s_trk_watch;     /* d 命令：循迹 8 位二进制连续显示 */
+static uint8_t s_keytest;       /* b 命令：按键识别模式（只报告不动作） */
 static uint8_t s_speed_trk;     /* o 命令：50 ms 速度曲线 */
 static uint8_t s_telem_on;      /* y 命令：遥测帧开关（默认关） */
 
@@ -273,7 +274,11 @@ static void cli_help(void)
     app_log("[cli] t            track mask / err\r\n");
     app_log("[cli] d            track 8-bit continuous display\r\n");
     app_log("[cli] g <kp> <ki> <ff>  set speed gains (x10)\r\n");
+    app_log("[cli] c [kp kd vs vc] steering gains (x10) and straight/corner speeds\r\n");
     app_log("[cli] o            speed trace 50 ms\r\n");
+    app_log("[cli] b            key identify mode (report only, no action)\r\n");
+    app_log("[cli] a            start (enter TRACK mode, same as start key)\r\n");
+    app_log("[cli] z <us>       set track i2c half period\r\n");
     app_log("[cli] i            imu yaw / gyro\r\n");
     app_log("[cli] v            car state\r\n");
     app_log("[cli] p            motor / pin / timer state\r\n");
@@ -337,9 +342,16 @@ static void cli_exec(void)
         break;
     }
 
+    case 'a':
+        /* 串口启动循迹模式（KEY1 坏了，用串口代替按键启动） */
+        ctrl_start();
+        app_log("[cli] start (mode TRACK)\r\n");
+        break;
+
     case 'x':
         ctrl_bench_stop();
         ctrl_hold_stop();
+        ctrl_stop();
         app_log("[cli] stop\r\n");
         break;
 
@@ -412,6 +424,41 @@ static void cli_exec(void)
                     (long)(a / 10), (long)(a % 10),
                     (long)(b / 10), (long)(b % 10),
                     (long)(c / 10), (long)(c % 10));
+        }
+        break;
+    }
+
+    case 'b':
+        /* 按键识别：板子没丝印时，发 b 后逐个按，看打印的是 KEY1/2/3。
+         * 此模式下按键不触发任何动作，安全。 */
+        s_keytest = (uint8_t)(s_keytest ? 0u : 1u);
+        app_log("[cli] key test %s\r\n", s_keytest ? "ON (keys only report)" : "OFF");
+        break;
+
+    case 'c': {
+        /* c                              打印当前转向/速度参数
+         * c <kp×10> <kd×10> <直道速度> <弯道速度>   在线设置
+         * 例：c 70 60 300 250  → kp=7.0 kd=6.0 直道 300 弯道 250 */
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            car_params_t *pp = ctrl_params();
+            float vs = 0.0f, vc = 0.0f;
+            int a, b;
+            fsm_get_speeds(&vs, &vc);
+            a = (int)(pp->steer_kp * 10.0f + 0.5f);
+            b = (int)(pp->steer_kd * 10.0f + 0.5f);
+            app_log("[cli] steer kp=%d.%d kd=%d.%d  vs=%d vc=%d\r\n",
+                    a / 10, a % 10, b / 10, b % 10, (int)vs, (int)vc);
+        } else {
+            int32_t a = cli_num(&p); p = cli_skip(p);
+            int32_t b = cli_num(&p); p = cli_skip(p);
+            int32_t vs = cli_num(&p); p = cli_skip(p);
+            int32_t vc = cli_num(&p);
+            ctrl_set_steer((float)a / 10.0f, (float)b / 10.0f);
+            fsm_set_speeds((float)vs, (float)vc);
+            app_log("[cli] set steer kp=%ld.%ld kd=%ld.%ld vs=%ld vc=%ld\r\n",
+                    (long)(a / 10), (long)(a % 10), (long)(b / 10), (long)(b % 10),
+                    (long)vs, (long)vc);
         }
         break;
     }
@@ -671,15 +718,26 @@ static void ctrl_task(void *arg)
 
         bsp_ui_scan();                   /* 按键：3 × 5 ms = 15 ms 消抖，兼作急停采样 */
 
-        if (bsp_ui_key_pressed(0u)) {    /* KEY1：启动 / 停止 */
-            if (ctrl_mode() == CAR_MODE_IDLE) ctrl_start();
-            else ctrl_stop();
-        }
-        if (bsp_ui_key_pressed(1u)) {    /* KEY2：IMU 零位 */
-            ctrl_calib_imu();
-        }
-        if (bsp_ui_key_pressed(2u)) {    /* KEY3：急停（粘滞，复位才能恢复） */
-            ctrl_estop();
+        if (s_keytest) {
+            /* 按键识别模式：只报告，不执行任何动作（按 KEY1 不会启动，按 KEY3 不会急停）。
+             * 板子没有丝印时用这个确认哪个物理键是哪一路。 */
+            uint8_t k;
+            for (k = 0u; k < 3u; k++) {
+                if (bsp_ui_key_pressed(k)) {
+                    app_log("[key] KEY%u pressed\r\n", (unsigned)(k + 1u));
+                }
+            }
+        } else {
+            if (bsp_ui_key_pressed(CFG_KEY_START_IDX)) {   /* 启动 / 停止 */
+                if (ctrl_mode() == CAR_MODE_IDLE) ctrl_start();
+                else ctrl_stop();
+            }
+            if (bsp_ui_key_pressed(CFG_KEY_IMU_IDX)) {     /* IMU 零位 */
+                ctrl_calib_imu();
+            }
+            if (bsp_ui_key_pressed(CFG_KEY_ESTOP_IDX)) {   /* 急停（粘滞） */
+                ctrl_estop();
+            }
         }
 
         ctrl_step();

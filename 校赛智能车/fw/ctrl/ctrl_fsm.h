@@ -34,6 +34,10 @@ void  fsm_stop(void);
 /* 手动指定下一个环岛是按圆还是按六边形处理（默认 0 = 圆形） */
 void  fsm_set_loop_kind(uint8_t kind);
 
+/* runtime speed targets (serial 'c' command) */
+void  fsm_set_speeds(float v_straight, float v_corner);
+void  fsm_get_speeds(float *v_straight, float *v_corner);
+
 void  fsm_step(const track_feat_t *trk, const imu_t *imu,
                int16_t speed_avg, int32_t dist_mm, uint32_t tick_ms);
 

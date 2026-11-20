@@ -44,6 +44,9 @@ uint8_t ctrl_hold_active(void);
 /* 运行时改速度环增益（会同步到 PID 对象） */
 void  ctrl_set_speed_gains(float kp, float ki, float ff);
 
+/* 运行时改转向增益（kp 传 0 表示只改 kd） */
+void  ctrl_set_steer(float kp, float kd);
+
 /* 台架诊断：速度环 PID 的内部状态 */
 float ctrl_pid_iacc_l(void);
 float ctrl_pid_iacc_r(void);

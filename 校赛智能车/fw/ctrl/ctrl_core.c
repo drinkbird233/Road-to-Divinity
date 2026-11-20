@@ -67,12 +67,14 @@ static lpf1_t  s_lpf_vr;
 static lpf1_t  s_lpf_e;
 static lpf1_t  s_lpf_gyro;
 
+/* 循迹误差的上次值，用于 PD 的微分项 */
+static float   s_e_prev;
+
 static track_feat_t s_feat;
 static imu_t        s_imu;
 static vision_t     s_vis;
 
-static float    s_v_meas_l;
-static float    s_v_meas_r;
+static float    s_v_meas_l;static float    s_v_meas_r;
 static float    s_yaw_ref;
 static int32_t  s_dist_mm;
 static int16_t  s_remote_l;
@@ -119,6 +121,9 @@ void ctrl_init(void)
     s_p.speed_ki    = CFG_SPEED_KI;
     s_p.speed_ff    = CFG_SPEED_FF;
     s_p.steer_kp    = CFG_STEER_KP;
+    s_p.steer_kd    = CFG_STEER_KD;
+    s_p.v_straight  = CFG_V_STRAIGHT;
+    s_p.v_corner    = CFG_V_CORNER;
     s_p.rate_kp     = CFG_RATE_KP;
     s_p.yaw_hold_kp = CFG_YAW_HOLD_KP;
     s_p.v_max       = CFG_V_MAX;
@@ -263,6 +268,14 @@ void ctrl_set_speed_gains(float kp, float ki, float ff)
     s_p.speed_ff = ff;
     pid_set_gains(&s_pid_l, kp, ki, 0.0f);
     pid_set_gains(&s_pid_r, kp, ki, 0.0f);
+}
+
+/* 运行时改转向增益（P 与 D）。D 是"预判弯道"的关键项。
+ * kp 传 0 表示只改 kd。 */
+void ctrl_set_steer(float kp, float kd)
+{
+    if (kp != 0.0f) s_p.steer_kp = kp;
+    s_p.steer_kd = kd;
 }
 
 /* 台架诊断：把速度环 PID 的内部状态暴露出来。
@@ -423,7 +436,17 @@ void ctrl_step(void)
     e = (line_ok ? s_feat.err : 0.0f) + fo->e_bias;
     e_f = lpf1_step(&s_lpf_e, e);
 
-    w_ref = fo->kp_scale * s_p.steer_kp * e_f;     /* e>0 = 线在右 → w>0 = 右转 */
+    /* PD：比例项负责"纠偏"，微分项负责"预判"。
+     * 只用 P 时，车必须等误差变大才开始打方向，弯道必然切外道冲出去；
+     * 加上误差变化率可以提前打方向，是循迹车最有效的一项。
+     * 微分作用在低通后的 e_f 上，避免传感器量化噪声被放大。 */
+    {
+        float de = (e_f - s_e_prev) / dt;
+        s_e_prev = e_f;
+        /* 只在看到线时用微分，丢线时 de 会变成噪声 */
+        w_ref = fo->kp_scale * (s_p.steer_kp * e_f +
+                                (line_ok ? s_p.steer_kd * de : 0.0f));
+    }
     w_ref = clampf(w_ref, -CFG_STEER_KP_MAX, CFG_STEER_KP_MAX);
 
     /* 视觉前馈：x>0 目标在右 → 想右转 → w 应为正 */

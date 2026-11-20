@@ -129,6 +129,9 @@ typedef struct {
     float speed_ki;
     float speed_ff;
     float steer_kp;
+    float steer_kd;          /* 循迹误差微分（预判弯道） */
+    float v_straight;        /* 直道目标速度 mm/s */
+    float v_corner;          /* 弯道目标速度 mm/s */
     float rate_kp;
     float yaw_hold_kp;
     float v_max;

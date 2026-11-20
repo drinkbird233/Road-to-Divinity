@@ -15,6 +15,13 @@
 #define CFG_TELEM_ENABLE        0
 #define CFG_UI_PERIOD_MS        100u  /* OLED / 按键 10 Hz */
 
+/* 按键重映射（物理键序号 0/1/2 = KEY1/KEY2/KEY3，对应 PC1/PC2/PC3）。
+ * 2026-11-20 实测：KEY1(PC1) 一直为低电平，读不到按下跳变（硬件问题），
+ * 所以把启动键换到 KEY2，IMU 零位先挂在坏掉的 KEY1 上（不会误触发）。 */
+#define CFG_KEY_START_IDX       1u    /* start/stop */
+#define CFG_KEY_IMU_IDX         0u    /* IMU zero (KEY1 is broken on this board) */
+#define CFG_KEY_ESTOP_IDX       2u    /* emergency stop */
+
 /* ======================= 机械 =======================
  * 电机 JGB37-520 / 12V / 减速比 30 / AB 双相磁性霍尔编码器�?1 线）
  *   输出轴空�?�?330 rpm �?65 mm �?�?1.12 m/s 空载，带载预�?0.7�?.9
@@ -60,8 +67,9 @@
 
 /* ======================= 转向（外�?+ 角速度环） ======================= */
 /* 位置环：误差 �?期望角速度。只�?想转多快"，不含陀螺仪（避免双阻尼导致稳态不转） */
-#define CFG_STEER_KP            45.0f /* °/s per 权重单位 */
-#define CFG_STEER_KP_MAX        140.0f/* 修正项限�?*/
+#define CFG_STEER_KP            70.0f /* deg/s per pitch. 45 was too slow for corners */
+#define CFG_STEER_KP_MAX        220.0f/* clamp for the steering term */
+#define CFG_STEER_KD            6.0f  /* deg/s per (pitch/s): derivative on line error, anticipates corners */
 /* 角速度环：Δv = RATE_FF*ω_ref + RATE_KP*(ω_ref �?ω_meas) */
 #define CFG_RATE_FF             (CFG_WHEEL_BASE_MM * 0.5f * 0.0174533f) /* mm/s per °/s */
 #define CFG_RATE_KP             0.35f /* mm/s per °/s，只做动态修�?*/
@@ -132,8 +140,8 @@
 
 /* ======================= 速度规划 =======================
  * 上限�?JGB37-520 30:1 决定：空�?1.12 m/s，带载预�?0.7�?.9�? * 先按表里 ~70% 跑通，再逐级提；每次 +100 mm/s，连�?5 圈不失误才继续加�? */
-#define CFG_V_STRAIGHT          800.0f
-#define CFG_V_CORNER            500.0f
+#define CFG_V_STRAIGHT          300.0f /* first-run speed; raise to 800 after line following is verified */
+#define CFG_V_CORNER            250.0f /* first-run corner speed */
 #define CFG_V_SCURVE            600.0f
 #define CFG_V_LOOP_CIRCLE       500.0f  /* 圆形环岛：半径大，可以快一�?*/
 #define CFG_V_LOOP_HEX          400.0f  /* 六边形环岛：边短 + 60° 折角，必须减�?*/
