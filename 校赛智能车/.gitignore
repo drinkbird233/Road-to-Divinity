@@ -1,4 +1,7 @@
 # ---- Keil 构建产物 ----
+# Keil 的输出目录以 target 命名（这里是 MDK-ARM/SmartCar_F407/），
+# 里面全是 .map/.htm/.lnp/.sct/.dep 等中间文件，整目录忽略。
+MDK-ARM/*/
 MDK-ARM/Objects/
 MDK-ARM/Listings/
 MDK-ARM/DebugConfig/
