@@ -278,6 +278,13 @@ void ctrl_set_steer(float kp, float kd)
     s_p.steer_kd = kd;
 }
 
+/* 运行时改角速度内环增益。kpHolder 传负值表示不改。 */
+void ctrl_set_rate(float rate_kp, float yaw_kp)
+{
+    if (rate_kp >= 0.0f) s_p.rate_kp = rate_kp;
+    if (yaw_kp  >= 0.0f) s_p.yaw_hold_kp = yaw_kp;
+}
+
 /* 台架诊断：把速度环 PID 的内部状态暴露出来。
  * 积分项 i_acc 是关键——如果稳态误差存在而 i_acc 不涨，说明积分被卡住了。 */
 float ctrl_pid_iacc_l(void)  { return s_pid_l.i_acc; }
@@ -470,7 +477,14 @@ void ctrl_step(void)
 
     /* ---------------- 6. 角速度环 ---------------- */
     if (imu_ok) {
-        gyro_r = -lpf1_step(&s_lpf_gyro, s_imu.gyro_dps);
+        /* HWT101 逆时针为正；全工程约定"右转为正"，所以取反。
+     * 如果实测符号相反（转动车头向右时 gyro_r 变负），把 CFG_GYRO_INVERT 改成 1。
+     * 符号错了这一环就变成正反馈，会直接暴振 —— 调 rate_kp 之前必须先确认这个。 */
+#if CFG_GYRO_INVERT
+    gyro_r =  lpf1_step(&s_lpf_gyro, s_imu.gyro_dps);
+#else
+    gyro_r = -lpf1_step(&s_lpf_gyro, s_imu.gyro_dps);
+#endif
     } else {
         /* IMU 丢了：退化为开环角速度，靠视觉/循迹慢慢纠正，绝不猛打 */
         gyro_r = 0.0f;
@@ -535,6 +549,7 @@ publish:
     s_sh.s.duty_l     = (int16_t)duty_l;
     s_sh.s.duty_r     = (int16_t)duty_r;
     s_sh.s.w_ref_ddps = (int16_t)(w_ref * 10.0f);
+    s_sh.s.dv_mm      = (int16_t)dv;
     s_sh.s.dist_mm    = s_dist_mm;
     s_sh.s.tick_ms    = now;
     s_sh.s.ctrl_ticks = s_ticks;

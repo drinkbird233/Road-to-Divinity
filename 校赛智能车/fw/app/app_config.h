@@ -122,6 +122,10 @@
 #define CFG_IMU_ANGLE_LSB       0.01f     /* [TODO] 角度�?LSB�?.01° */
 #define CFG_IMU_GYRO_LSB        0.01f     /* [TODO] 角速度�?LSB�?.01°/s */
 #define CFG_IMU_TIMEOUT_MS      200u
+/* gyro sign: full project uses right-turn-positive. If turning the car RIGHT makes
+ * the 'j' trace's 2nd number go NEGATIVE, set this to 1. Wrong sign makes the
+ * rate loop positive-feedback and it will oscillate violently. */
+#define CFG_GYRO_INVERT         0
 #define CFG_IMU_HOLDOVER_MS     300u      /* �?IMU 后靠上次 ω 维持多久 */
 
 /* ======================= 通信 ======================= */

@@ -88,6 +88,7 @@ typedef struct {
     int16_t     v_ref_r;
     int16_t     duty_l;      /* 实际下发的占空比 */
     int16_t     duty_r;
+    int16_t     dv_mm;       /* 角速度环输出的差速 mm/s */
     int16_t     w_ref_ddps;  /* 0.1°/s */
     int32_t     dist_mm;     /* 累计里程 */
     uint32_t    tick_ms;

@@ -222,6 +222,7 @@ static uint32_t s_cli_ms;       /* 最后一次收到字节的时刻 */
 static uint8_t s_watch;         /* w 命令：编码器/速度连续监控 */
 static uint8_t s_trk_watch;     /* d 命令：循迹 8 位二进制连续显示 */
 static uint8_t s_keytest;       /* b 命令：按键识别模式（只报告不动作） */
+static uint8_t s_rate_trk;      /* j 命令：50 ms 角速度环曲线 */
 static uint8_t s_speed_trk;     /* o 命令：50 ms 速度曲线 */
 static uint8_t s_telem_on;      /* y 命令：遥测帧开关（默认关） */
 
@@ -275,6 +276,8 @@ static void cli_help(void)
     app_log("[cli] d            track 8-bit continuous display\r\n");
     app_log("[cli] g <kp> <ki> <ff>  set speed gains (x10)\r\n");
     app_log("[cli] c [kp kd vs vc] steering gains (x10) and straight/corner speeds\r\n");
+    app_log("[cli] l [ratekp yawkp] rate loop gains (x100), -1 keeps\r\n");
+    app_log("[cli] j            rate loop trace 50 ms (wref / gyro / dv)\r\n");
     app_log("[cli] o            speed trace 50 ms\r\n");
     app_log("[cli] b            key identify mode (report only, no action)\r\n");
     app_log("[cli] a            start (enter TRACK mode, same as start key)\r\n");
@@ -459,6 +462,39 @@ static void cli_exec(void)
             app_log("[cli] set steer kp=%ld.%ld kd=%ld.%ld vs=%ld vc=%ld\r\n",
                     (long)(a / 10), (long)(a % 10), (long)(b / 10), (long)(b % 10),
                     (long)vs, (long)vc);
+        }
+        break;
+    }
+
+    case 'j':
+        /* 角速度环曲线：每 50 ms 一行 "<角速度目标> <陀螺仪实测(右正)> <差速输出>"
+         * 单位都是 0.1°/s 和 mm/s。用来验证符号和调 rate_kp。 */
+        s_rate_trk = (uint8_t)(s_rate_trk ? 0u : 1u);
+        app_log("[cli] rate trace %s\r\n", s_rate_trk ? "ON" : "OFF");
+        break;
+
+    case 'l': {
+        /* l                    打印角速度环增益
+         * l <rate_kp×100> <yaw_kp×100>   在线设置（传 -1 表示不改该项）
+         * 例：l 35 80  → rate_kp=0.35  yaw_hold_kp=0.80 */
+        car_params_t *pp = ctrl_params();
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            int a = (int)(pp->rate_kp * 100.0f + 0.5f);
+            int b = (int)(pp->yaw_hold_kp * 100.0f + 0.5f);
+            app_log("[cli] rate kp=%d.%02d  yaw_kp=%d.%02d\r\n",
+                    a / 100, a % 100, b / 100, b % 100);
+        } else {
+            int32_t a = cli_num(&p); p = cli_skip(p);
+            int32_t b = cli_num(&p);
+            ctrl_set_rate((a < 0) ? -1.0f : (float)a / 100.0f,
+                          (b < 0) ? -1.0f : (float)b / 100.0f);
+            {
+                int x = (int)(ctrl_params()->rate_kp * 100.0f + 0.5f);
+                int y = (int)(ctrl_params()->yaw_hold_kp * 100.0f + 0.5f);
+                app_log("[cli] set rate kp=%d.%02d yaw_kp=%d.%02d\r\n",
+                        x / 100, x % 100, y / 100, y % 100);
+            }
         }
         break;
     }
@@ -766,6 +802,7 @@ static void comm_task(void *arg)
     uint32_t next_watch = 0u;
     uint32_t next_trkw = 0u;
     uint32_t next_spd = 0u;
+    uint32_t next_rate = 0u;
     uint32_t next_btdbg = 0u;
 
     (void)arg;
@@ -847,6 +884,17 @@ static void comm_task(void *arg)
                 app_log("[o] %d %d %d %d %d\r\n",
                         (int)ss.v_ref_l, (int)ss.speed_l, (int)ss.speed_r,
                         (int)ss.duty_l, (int)ss.duty_r);
+            }
+        }
+
+        /* j 打开时的角速度环曲线：每 50 ms 一行 */
+        if (s_rate_trk && (uint32_t)(HAL_GetTick() - next_rate) >= 50u) {
+            car_state_t rs;
+            next_rate = HAL_GetTick();
+            if (st_snap(ctrl_shadow(), &rs)) {
+                /* gr = gyro_right（右转为正）= -imu.gyro */
+                app_log("[j] %d %d %d\r\n",
+                        (int)rs.w_ref_ddps, (int)(-rs.gyro_ddps), (int)rs.dv_mm);
             }
         }
 
