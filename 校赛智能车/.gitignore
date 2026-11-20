@@ -1,0 +1,39 @@
+# ---- Keil 构建产物 ----
+MDK-ARM/Objects/
+MDK-ARM/Listings/
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.bak
+MDK-ARM/*.dep
+MDK-ARM/*.lnp
+MDK-ARM/*.sct
+MDK-ARM/*.map
+MDK-ARM/*.htm
+MDK-ARM/*.lst
+MDK-ARM/*.build_log.htm
+MDK-ARM/JLinkLog.txt
+MDK-ARM/JLinkSettings.ini
+
+# ---- 编译器中间文件 ----
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.bin
+*.elf
+*.iex
+*.l1p
+*.l2p
+
+# ---- 系统 / 编辑器 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+*.swp
+
+# ---- 本地调试产物 ----
+*.broken
+_*.txt
