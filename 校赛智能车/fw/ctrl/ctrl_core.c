@@ -69,6 +69,17 @@ static lpf1_t  s_lpf_gyro;
 
 /* 循迹误差的上次值，用于 PD 的微分项 */
 static float   s_e_prev;
+/* PD 的微分值，只在循迹更新拍刷新（100 Hz），空拍沿用 */
+static float   s_de;
+/* 最后一次"看到线"的误差和时刻（补线的起点） */
+static float   s_e_last;
+static uint32_t s_e_last_ms;
+/* 补线：误差/里程历史，用来算"误差随里程的斜率" */
+static float   s_ph_e[CFG_PRED_HIST];
+static int32_t s_ph_d[CFG_PRED_HIST];
+static uint8_t s_ph_n;
+static float   s_pred_slope;      /* err per mm */
+static int32_t s_e_last_d0;       /* 最后一次看到线时的里程 */
 
 static track_feat_t s_feat;
 static imu_t        s_imu;
@@ -77,11 +88,22 @@ static vision_t     s_vis;
 static float    s_v_meas_l;static float    s_v_meas_r;
 static float    s_yaw_ref;
 static int32_t  s_dist_mm;
+/* 【2026-11-22 修】里程用浮点累加，对外仍以整数 mm 暴露。
+ *
+ * 原来写的是 s_dist_mm += (int32_t)(v * 0.005)，每拍增量小于 1 mm 就被截成 0：
+ *   v=100 mm/s → 0.50 mm → 截成 0（完全不计）
+ *   v=150 mm/s → 0.75 mm → 截成 0（完全不计）
+ *   v=300 mm/s → 1.50 mm → 截成 1（少记 33%）
+ * 结果是 dist 只在 v>=200 时才增长，且比例随车速变化，不能用系数修正。
+ * 手推车测里程（约 100~150 mm/s）会得到恒为 0 的 dist。
+ * 改成浮点累加后，任何速度都按真实值累计。 */
+static float    s_dist_acc;
 static int16_t  s_remote_l;
 static int16_t  s_remote_r;
 
 static uint8_t  s_mode;
 static uint8_t  s_estop;
+static uint8_t  s_vis_gap;      /* 视觉预告：前方是断口（最近一帧且在超时内） */
 static uint16_t s_fault;
 static uint16_t s_fsm_div;
 static uint32_t s_tick_ms;
@@ -100,6 +122,15 @@ static uint32_t s_track_ok_ms;
 static uint32_t s_cmd_ms;
 static uint32_t s_vbat_ms;
 static uint16_t s_vbat_mv;
+
+/* 上一拍的元素编号，用于检测"元素切换"这个瞬间 */
+static uint8_t  s_el_prev = 0xFFu;
+
+/* ---- 定角转弯（台架 u 命令，也是 EL_TURN90 的验证手段） ---- */
+static uint8_t  s_turn;
+static float    s_turn_target;
+static uint32_t s_turn_ms;
+static uint32_t s_turn_ok_ms;
 
 static float wrap180f(float d)
 {
@@ -149,6 +180,7 @@ void ctrl_init(void)
     s_v_meas_r = 0.0f;
     s_yaw_ref  = 0.0f;
     s_dist_mm  = 0;
+    s_dist_acc = 0.0f;
     s_remote_l = 0;
     s_remote_r = 0;
     s_mode     = CAR_MODE_IDLE;
@@ -165,6 +197,12 @@ void ctrl_init(void)
     s_vbat_mv  = 0u;
 
     s_sh.seq = 0u;
+
+    s_el_prev    = 0xFFu;
+    s_turn       = 0u;
+    s_turn_target = 0.0f;
+    s_turn_ms    = 0u;
+    s_turn_ok_ms = 0u;
 }
 
 void ctrl_start(void)
@@ -259,6 +297,36 @@ uint8_t ctrl_hold_active(void)
     return s_hold;
 }
 
+/* ---------------- 定角转弯（台架验证用） ---------------- */
+
+/* 以当前朝向为基准转到 yaw+deg（正 = 右转），到位或超时自动停车。
+ * 这是 EL_TURN90 的"单步验证器"：先在台架上把 TURN_KP / TOL / 转弯速度调好，
+ * 再让状态机去用 —— 避免一上车就在赛道上试错，撞一次可能就报废一个舵机。 */
+void ctrl_bench_turn(float deg)
+{
+    if (deg >  180.0f) deg =  180.0f;
+    if (deg < -180.0f) deg = -180.0f;
+
+    s_turn_target = wrap180f(s_imu.yaw_deg + g_yaw_sgn * deg);
+    s_turn_ms     = HAL_GetTick();
+    s_turn_ok_ms  = 0u;
+    s_turn        = 1u;
+    s_bench       = 0u;             /* 三种手动模式互斥 */
+    s_hold        = 0u;
+    s_cmd_ms      = HAL_GetTick();
+}
+
+void ctrl_bench_turn_stop(void)
+{
+    s_turn = 0u;
+    bsp_motor_force_stop();
+}
+
+uint8_t ctrl_bench_turn_active(void)
+{
+    return s_turn;
+}
+
 /* 运行时改速度环增益：参数副本和 PID 对象**都要**更新。
  * （只改 s_p 的话 pid_step 用的 p->kp/p->ki 还是初始化时的值，改了等于没改。） */
 void ctrl_set_speed_gains(float kp, float ki, float ff)
@@ -268,6 +336,30 @@ void ctrl_set_speed_gains(float kp, float ki, float ff)
     s_p.speed_ff = ff;
     pid_set_gains(&s_pid_l, kp, ki, 0.0f);
     pid_set_gains(&s_pid_r, kp, ki, 0.0f);
+}
+
+/* 补线的斜率（err / mm）。
+ * 状态机用它区分"弯道"和"断口"：斜率大 = 线在横向扫出去 = 弯道；
+ * 斜率≈0 = 线一直居中 = 直道断口。
+ * 比"丢线前一刻的误差"可靠得多（那个值随采样时刻随机跳）。 */
+float ctrl_pred_slope(void) { return s_pred_slope; }
+
+/* 视觉预告的断口：1 = 前方没有线（盲走区） */
+uint8_t ctrl_vis_gap(void) { return s_vis_gap; }
+
+/* 历史窗口内的平均 |误差|。
+ * 断线口：线一直居中 → 接近 0
+ * 直角弯：线在往外跑 → 0.5 以上（最后两拍的"扫出"会拉高平均）
+ * 比单个采样稳定，用来区分断口和弯道。 */
+float ctrl_pred_mabs(void)
+{
+    uint8_t i;
+    float   s = 0.0f;
+    if (s_ph_n == 0u) return 0.0f;
+    for (i = 0u; i < s_ph_n; i++) {
+        s += (s_ph_e[i] < 0.0f) ? -s_ph_e[i] : s_ph_e[i];
+    }
+    return s / (float)s_ph_n;
 }
 
 /* 运行时改转向增益（P 与 D）。D 是"预判弯道"的关键项。
@@ -310,7 +402,7 @@ void ctrl_step(void)
     int16_t  dl = 0, dr = 0;
     float    vl_raw, vr_raw, e, e_f, w_ref, gyro_r, dv, v_cmd;
     float    vl_ref, vr_ref, duty_l, duty_r;
-    uint8_t  imu_ok, vis_ok, line_ok;
+    uint8_t  imu_ok, vis_ok, line_ok, trk_upd = 0u;
     const fsm_out_t *fo;
 
     s_tick_ms = now;
@@ -323,6 +415,7 @@ void ctrl_step(void)
     if (++s_trk_div >= 2u) {
         int trc;
         s_trk_div = 0u;
+        trk_upd = 1u;               /* 本拍真的读了循迹，D 项要按 2 拍算 */
         trc = bsp_track_read(&s_feat);
         s_track_rc = (int8_t)trc;
         if (trc == 0) {
@@ -334,10 +427,16 @@ void ctrl_step(void)
     }
 
     /* 盲走类元素本来就允许长时间没有线（它们靠 IMU 走），
-     * 不能算成"丢线故障"，否则盲走区/路口会在半路上被强制停车。 */
+     * 不能算成"丢线故障"，否则盲走区/路口会在半路上被强制停车。
+     *
+     * 【2026-11-22 修】原来漏了 EL_TURN90 和 EL_SEEK。
+     * 直角弯整个动作就是"没有线、靠陀螺仪转"，只要 300 ms 没线就会
+     * 触发 FAULT_LINE_LOST → 强制停车，转弯转到一半电机就断电了
+     * （实测：yaw 只转了 58~59° 就停，状态从 12 直接跳到 10）。
+     * 这两个状态必须一起进白名单。 */
     {
         uint8_t el = (uint8_t)fsm_out()->el;
-        if (el == EL_BLIND || el == EL_CROSS ||
+        if (el == EL_BLIND || el == EL_CROSS || el == EL_TURN90 || el == EL_SEEK ||
             el == EL_LOOP_IN || el == EL_LOOP_RUN || el == EL_LOOP_OUT) {
             s_track_ok_ms = now;
         }
@@ -351,7 +450,8 @@ void ctrl_step(void)
     vr_raw = speed_window(&s_win_r, dr, fs);
     s_v_meas_l = lpf1_step(&s_lpf_vl, vl_raw);
     s_v_meas_r = lpf1_step(&s_lpf_vr, vr_raw);
-    s_dist_mm += (int32_t)((vl_raw + vr_raw) * 0.5f * dt);
+    s_dist_acc += (vl_raw + vr_raw) * 0.5f * dt;
+    s_dist_mm   = (int32_t)s_dist_acc;
 
     imu_ok = (uint8_t)(bsp_imu_get(&s_imu) &&
                        ((uint32_t)(now - s_imu.last_ms) < CFG_IMU_TIMEOUT_MS));
@@ -359,6 +459,11 @@ void ctrl_step(void)
                        ((uint32_t)(now - s_vis.last_ms) < CFG_VIS_TIMEOUT_MS) &&
                        s_vis.valid);
     line_ok = (uint8_t)(s_feat.valid && !s_feat.junction);
+
+    /* 视觉的"断口"预告：最近一帧（且在超时内）说前面没有线。
+     * 状态机用它决定"丢线时是直行穿过还是转弯找线"。
+     * 视觉断流/超时时这里恒为 0，状态机就退回原来的"转着找线"，不会卡死。 */
+    s_vis_gap = (uint8_t)(vis_ok && ((s_vis.flags & VIS_FLAG_KIND_MASK) == VIS_FLAG_GAP));
 
     /* ---------------- 2. 电池 / 故障 ---------------- */
     if ((uint32_t)(now - s_vbat_ms) >= 100u) {
@@ -390,6 +495,16 @@ void ctrl_step(void)
                  s_dist_mm, now);
     }
     fo = fsm_out();
+
+    /* 元素切换的瞬间，把"当前朝向"记成新的航向参考。
+     * 为什么必须做：s_yaw_ref 平时只在跟线居中时以 0.05 的慢系数跟随，
+     * 所以转完 90°、或盲走一段之后，它一定是旧值。等重新锁线、|e| 落进 1.2 以内时，
+     * yaw_hold 会突然按 0.8*(yaw - 旧参考) 打一个几十度每秒的偏置 —— 车会猛地一歪。
+     * 换状态时重置一次，代价很小，收益是把这个跳变彻底消掉。 */
+    if ((uint8_t)fo->el != s_el_prev) {
+        s_el_prev = (uint8_t)fo->el;
+        s_yaw_ref = s_imu.yaw_deg;
+    }
 
     /* ---------------- 3.5 台架模式：直接输出占空比，跳过所有控制 ---------------- */
     if (s_bench && !(s_fault & (FAULT_ESTOP | FAULT_LOW_BATT))) {
@@ -429,6 +544,53 @@ void ctrl_step(void)
         goto publish;
     }
 
+    /* ---------------- 3.7 定角转弯（台架 u 命令） ----------------
+     * 和 s_bench / s_hold 一样是"绕过循迹"的手动模式，但走的是同一条
+     *     角度环 → 角速度环 → 差速 → 速度环
+     * 链路，所以这里测出来的就是 EL_TURN90 上车后会用的东西。
+     * 到位自动停、超时也停，绝不原地打转。 */
+    if (s_turn && (s_fault & (FAULT_ESTOP | FAULT_LOW_BATT))) {
+        s_turn = 0u;                /* 故障优先：转弯立刻放弃 */
+    }
+    if (s_turn) {
+        float gy  = imu_ok ? -lpf1_step(&s_lpf_gyro, s_imu.gyro_dps) : 0.0f;
+        float dh  = wrap180f(s_turn_target - s_imu.yaw_deg);
+        float w   = clampf(g_yaw_sgn * CFG_TURN_KP * dh, -CFG_W_MAX, CFG_W_MAX);
+        float dvt = clampf(CFG_RATE_FF * w + s_p.rate_kp * (w - gy),
+                           -CFG_DV_MAX, CFG_DV_MAX);
+
+        bsp_motor_enable(true);
+        vl_ref = clampf(CFG_V_TURN + dvt, -s_p.v_max, s_p.v_max);
+        vr_ref = clampf(CFG_V_TURN - dvt, -s_p.v_max, s_p.v_max);
+        duty_l = s_p.speed_ff * vl_ref + pid_step(&s_pid_l, vl_ref, s_v_meas_l, dt);
+        duty_r = s_p.speed_ff * vr_ref + pid_step(&s_pid_r, vr_ref, s_v_meas_r, dt);
+        bsp_motor_set(duty_l, duty_r);
+
+        /* 到位：角度进容差 且 角速度降下来（同 ctrl_fsm 的 EL_TURN90） */
+        if ((fabsf(dh) < CFG_TURN_TOL_DEG) && (fabsf(gy) < CFG_TURN_STOP_DPS)) {
+            if (s_turn_ok_ms == 0u) s_turn_ok_ms = now;
+            if ((uint32_t)(now - s_turn_ok_ms) >= CFG_TURN_SETTLE_MS) s_turn = 0u;
+        } else {
+            s_turn_ok_ms = 0u;
+        }
+        if ((uint32_t)(now - s_turn_ms) > CFG_TURN_TIMEOUT_MS) s_turn = 0u;
+
+        if (!s_turn) {              /* 到位 / 超时：停车收工 */
+            bsp_motor_force_stop();
+            pid_reset(&s_pid_l, 0.0f);
+            pid_reset(&s_pid_r, 0.0f);
+            vl_ref = 0.0f; vr_ref = 0.0f;
+            duty_l = 0.0f; duty_r = 0.0f;
+            w      = 0.0f;
+            dvt    = 0.0f;
+        }
+
+        v_cmd = 0.0f;
+        w_ref = w;
+        dv    = dvt;
+        goto publish;
+    }
+
     /* ---------------- 4. 目标速度 ---------------- */
     if (s_mode == CAR_MODE_TRACK || s_mode == CAR_MODE_VISION) {
         v_cmd = fo->v_cmd;
@@ -438,42 +600,101 @@ void ctrl_step(void)
         v_cmd = 0.0f;
     }
 
-    /* ---------------- 5. 转向：位置环 ---------------- */
-    /* 偏置在丢线时仍然保留：环岛/路口的"盲走段"就是靠它保持方向 */
-    e = (line_ok ? s_feat.err : 0.0f) + fo->e_bias;
+    /* ---------------- 5. 转向：位置环 / 角度环 ----------------
+     *
+     * 【补线】线消失时，用最后几个有效点外推出线应该在哪，而不是简单地
+     * 保持（E_HOLD）或清零。这是智能车竞赛的通用做法，好处是**一套逻辑
+     * 同时解决断口和弯道**：
+     *   · 直道断口：消失前误差一直居中、斜率≈0 → 外推≈0 → 直行
+     *   · 直角弯  ：消失前误差快速变大、斜率很大 → 外推迅速饱和 → 一直转到看见线
+     * 所以不需要再"判断这是直角弯还是断口"。
+     *
+     * 外推是**按里程**算的（err 对 mm 的斜率），不是按时间，
+     * 所以车速变了外推的几何形状不变。
+     */
+    if (line_ok) {
+        /* 写入历史并算斜率（最老 -> 最新） */
+        uint8_t k;
+        for (k = 0u; k + 1u < CFG_PRED_HIST; k++) {
+            s_ph_e[k] = s_ph_e[k + 1u];
+            s_ph_d[k] = s_ph_d[k + 1u];
+        }
+        s_ph_e[CFG_PRED_HIST - 1u] = s_feat.err;
+        s_ph_d[CFG_PRED_HIST - 1u] = s_dist_mm;
+        if (s_ph_n < CFG_PRED_HIST) s_ph_n++;
+
+        if (s_ph_n >= 3u) {
+            int32_t dd = s_ph_d[CFG_PRED_HIST - 1u] - s_ph_d[0];
+            if (dd >= (int32_t)CFG_PRED_MIN_MM) {
+                s_pred_slope = (s_ph_e[CFG_PRED_HIST - 1u] - s_ph_e[0]) / (float)dd;
+            } else {
+                s_pred_slope = 0.0f;      /* 里程太短，斜率不可信 */
+            }
+        }
+        s_e_last    = s_feat.err;
+        s_e_last_ms = now;
+        e = s_feat.err;
+    } else if ((uint32_t)(now - s_e_last_ms) < CFG_PRED_TIMEOUT_MS) {
+        /* 外推：误差 = 最后一次 + 斜率 × 走过的里程 */
+        float pred = s_e_last + s_pred_slope * (float)(s_dist_mm - s_e_last_d0);
+        if (pred >  CFG_PRED_MAX) pred =  CFG_PRED_MAX;
+        if (pred < -CFG_PRED_MAX) pred = -CFG_PRED_MAX;
+        e = pred;
+    } else {
+        e = 0.0f;                         /* 外推超时：交给航向保持/盲走 */
+    }
+    if (line_ok) s_e_last_d0 = s_dist_mm; /* 记住"最后一次看到线时的里程" */
+    e += fo->e_bias;
     e_f = lpf1_step(&s_lpf_e, e);
 
-    /* PD：比例项负责"纠偏"，微分项负责"预判"。
-     * 只用 P 时，车必须等误差变大才开始打方向，弯道必然切外道冲出去；
-     * 加上误差变化率可以提前打方向，是循迹车最有效的一项。
-     * 微分作用在低通后的 e_f 上，避免传感器量化噪声被放大。 */
-    {
-        float de = (e_f - s_e_prev) / dt;
-        s_e_prev = e_f;
-        /* 只在看到线时用微分，丢线时 de 会变成噪声 */
-        w_ref = fo->kp_scale * (s_p.steer_kp * e_f +
-                                (line_ok ? s_p.steer_kd * de : 0.0f));
-    }
-    w_ref = clampf(w_ref, -CFG_STEER_KP_MAX, CFG_STEER_KP_MAX);
-
-    /* 视觉前馈：x>0 目标在右 → 想右转 → w 应为正 */
-    if (vis_ok) {
-        float xn = (float)s_vis.x / 1000.0f;
-        w_ref += s_p.steer_kp * 3.5f * xn * s_p.vis_kff;
-    }
-
-    /* 航向保持：dh>0 表示车头比参考更偏左 → 需要右转 → w>0。
-     * 丢线时也允许保持（路口的盲走段就靠它），但只在"看到线且居中"时才更新参考，
-     * 否则盲走段会把参考慢慢拉成当前朝向，等于没有保持。 */
-    if (imu_ok && fo->yaw_hold && (!line_ok || fabsf(e) < CFG_YAW_HOLD_ERR_MAX)) {
-        float dh = wrap180f(s_imu.yaw_deg - s_yaw_ref);
-        w_ref += s_p.yaw_hold_kp * dh;
-        if (line_ok && fabsf(e) < CFG_YAW_HOLD_ERR_MAX) {
-            s_yaw_ref += 0.05f * dh;
+    if (fo->w_mode == 1u && imu_ok) {
+        /* 角度环（直角弯）：完全不用 8 路位置项，直接按航向误差给角速度目标。
+         * 这一支必须**跳过** PD、视觉前馈、航向保持 —— 三个源同时往里加会互相打架，
+         * 而且此时车本来就看不到线（line_ok=0），循迹项全是噪声。 */
+        float dh_t = wrap180f(fo->yaw_target - s_imu.yaw_deg);
+        w_ref    = clampf(g_yaw_sgn * CFG_TURN_KP * dh_t, -CFG_W_MAX, CFG_W_MAX);
+        s_e_prev = e_f;         /* 保持微分历史连续，退出角度环那一刻不会打突 */
+    } else {
+        /* PD：比例项负责"纠偏"，微分项负责"预判"。
+         * 【缺陷④修正】循迹是 100 Hz 读的（每 2 拍），如果每拍都求导，
+         * 导数会在"更新拍"出现尖峰、"空拍"为 0，产生 100 Hz 的方向抖动。
+         * 所以只在**真正读到新数据的拍**更新微分，并按 2 拍的时间间隔算速率。 */
+        {
+            if (trk_upd) {
+                s_de    = (e_f - s_e_prev) / (dt * (float)CFG_FSM_DIVIDER);
+                s_e_prev = e_f;
+            }
+            w_ref = fo->kp_scale * (s_p.steer_kp * e_f +
+                                    (line_ok ? s_p.steer_kd * s_de : 0.0f));
         }
-    }
+        w_ref = clampf(w_ref, -CFG_STEER_KP_MAX, CFG_STEER_KP_MAX);
 
-    w_ref = clampf(w_ref, -CFG_W_MAX, CFG_W_MAX);
+        /* 视觉前馈：x>0 目标在右 → 想右转 → w 应为正 */
+        if (vis_ok) {
+            float xn = (float)s_vis.x / 1000.0f;
+            w_ref += s_p.steer_kp * 3.5f * xn * s_p.vis_kff;
+        }
+
+        /* 航向保持：w = sgn * K * (ref - yaw)，是负反馈。
+         * 丢线时也允许保持（盲走段就靠它），但只在"看到线且居中"时才更新参考，
+         * 否则盲走段会把参考慢慢拉成当前朝向，等于没有保持。
+         *
+         * 2026-11-22 修正：原来写的是 dh=(yaw-ref) 且不带符号，
+         * 只在"右转时 yaw 变小"的模块约定下才是负反馈；约定相反时变成正反馈，
+         * 车会朝一边跑飞 —— 这正是"盲走一走就偏"的典型症状。 */
+        if (imu_ok && fo->yaw_hold &&
+            (fo->yaw_hard || !line_ok || fabsf(e) < CFG_YAW_HOLD_ERR_MAX)) {
+            float dh = wrap180f(s_yaw_ref - s_imu.yaw_deg);
+            w_ref += g_yaw_sgn * s_p.yaw_hold_kp * dh;
+            /* 参考缓慢跟随当前朝向，所以是 -= （dh 已反向）。
+             * 硬保持模式**不跟随**：否则参考会被漂移一路拖走，等于没有保持。 */
+            if (!fo->yaw_hard && line_ok && fabsf(e) < CFG_YAW_HOLD_ERR_MAX) {
+                s_yaw_ref -= 0.05f * dh;
+            }
+        }
+
+        w_ref = clampf(w_ref, -CFG_W_MAX, CFG_W_MAX);
+    }
 
     /* ---------------- 6. 角速度环 ---------------- */
     if (imu_ok) {
@@ -505,7 +726,11 @@ void ctrl_step(void)
     vr_ref = clampf(vr_ref, -s_p.v_max, s_p.v_max);
 
     if (s_mode == CAR_MODE_IDLE || s_mode == CAR_MODE_TEST ||
-        (s_fault & (FAULT_ESTOP | FAULT_LOW_BATT | FAULT_LINE_LOST))) {
+        (s_fault & (FAULT_ESTOP | FAULT_LOW_BATT | FAULT_LINE_LOST)) ||
+        /* 直角弯整个动作都靠陀螺仪，IMU 一丢就没有任何反馈了 ——
+         * 此时按 w_mode 分支会退化成"w_ref=0"，车会直着冲出去。
+         * 宁可停车，也不要在盲转状态下继续跑。 */
+        (fo->el == EL_TURN90 && (s_fault & FAULT_IMU_LOST))) {
         bsp_motor_force_stop();
         pid_reset(&s_pid_l, 0.0f);
         pid_reset(&s_pid_r, 0.0f);
@@ -536,6 +761,7 @@ publish:
     s_sh.s.track_raw  = s_feat.raw_phys;
     s_sh.s.track_rc   = s_track_rc;
     s_sh.s.line_err   = s_feat.err;
+    s_sh.s.err_lv_x100 = (int16_t)(fsm_err_lv() * 100.0f);
     s_sh.s.line_valid = line_ok;
     s_sh.s.vis_x      = s_vis.x;
     s_sh.s.vis_y      = s_vis.y;

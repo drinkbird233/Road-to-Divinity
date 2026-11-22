@@ -40,3 +40,7 @@ desktop.ini
 # ---- 本地调试产物 ----
 *.broken
 _*.txt
+
+# ---- Python 缓存（K230 脚本目录）----
+__pycache__/
+*.pyc

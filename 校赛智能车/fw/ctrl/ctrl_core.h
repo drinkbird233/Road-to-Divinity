@@ -41,6 +41,13 @@ void  ctrl_hold_speed(float mm_s_l, float mm_s_r);
 void  ctrl_hold_stop(void);
 uint8_t ctrl_hold_active(void);
 
+/* ---- 定角转弯（台架验证，也是 EL_TURN90 的调参手段） ----
+ * ctrl_bench_turn(90) 以当前朝向为基准右转 90°，到位/超时自动停车。
+ * 用车架空或放空地，手不离急停。 */
+void  ctrl_bench_turn(float deg);
+void  ctrl_bench_turn_stop(void);
+uint8_t ctrl_bench_turn_active(void);
+
 /* 运行时改速度环增益（会同步到 PID 对象） */
 void  ctrl_set_speed_gains(float kp, float ki, float ff);
 
@@ -49,6 +56,14 @@ void  ctrl_set_steer(float kp, float kd);
 
 /* 运行时改角速度内环增益（传负值表示不改该项） */
 void  ctrl_set_rate(float rate_kp, float yaw_kp);
+
+/* 补线斜率（err/mm）：状态机用它区分弯道和断口 */
+float ctrl_pred_slope(void);
+/* 历史窗口内的平均 |误差|：断口≈0，弯道>0.5 */
+float ctrl_pred_mabs(void);
+
+/* 视觉预告：1 = 前方没有线（盲走区）。视觉断流时为 0。 */
+uint8_t ctrl_vis_gap(void);
 
 /* 台架诊断：速度环 PID 的内部状态 */
 float ctrl_pid_iacc_l(void);

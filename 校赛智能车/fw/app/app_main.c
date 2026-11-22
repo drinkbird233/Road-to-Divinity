@@ -282,6 +282,8 @@ static void cli_help(void)
     app_log("[cli] b            key identify mode (report only, no action)\r\n");
     app_log("[cli] a            start (enter TRACK mode, same as start key)\r\n");
     app_log("[cli] z <us>       set track i2c half period\r\n");
+    app_log("[cli] K            k230 vision link check\r\n");
+    app_log("[cli] vi           same as K (lowercase alias)\r\n");
     app_log("[cli] i            imu yaw / gyro\r\n");
     app_log("[cli] v            car state\r\n");
     app_log("[cli] p            motor / pin / timer state\r\n");
@@ -441,7 +443,16 @@ static void cli_exec(void)
     case 'c': {
         /* c                              打印当前转向/速度参数
          * c <kp×10> <kd×10> <直道速度> <弯道速度>   在线设置
-         * 例：c 70 60 300 250  → kp=7.0 kd=6.0 直道 300 弯道 250 */
+         * 例：c 700 0 300 180  → kp=70.0 kd=0 直道 300 弯道 180
+         *
+         * ⚠️ 单位不对称，这是本项目最容易错的地方：
+         *   前两个是 ×10 存的（700 → 70.0），后两个是 mm/s 原值（300 → 300 mm/s）。
+         *   旧注释曾写 "c 70 60 300 250 → kp=7.0 kd=6.0"，把 kp 砍到默认值的 1/10，
+         *   导致"弯道怎么调都冲出去"（详见 docs/09_corner_fix.md）。
+         *
+         * ⚠️ 0 的语义：kp 传 0 = 不改（ctrl_set_steer 里判 !=0）；
+         *   但 kd 每次都会被写入，所以 c 700 这种少写参数的写法会把 kd 清成 0；
+         *   vs/vc 传 0 = 不改（fsm_set_speeds 里判 >0）。 */
         p = cli_skip(p + 1);
         if (*p == '\0') {
             car_params_t *pp = ctrl_params();
@@ -610,7 +621,159 @@ static void cli_exec(void)
         }
         break;
 
+    case 'Y': {
+        /* Y      翻转航向符号（右转时 yaw 是变大还是变小），现场定符号用
+         *
+         * 台架 30 秒定案：
+         *   i  ->  手把车头向右转 90°  ->  i
+         *   yaw 变大 -> 应为 +1；yaw 变小 -> 应为 -1
+         * 这个符号决定航向保持和定角转弯是负反馈还是正反馈，反了车会朝一边跑飞。 */
+        fsm_toggle_yaw_sign();
+        app_log("[cli] yaw sign = %d (right turn -> yaw %s)\r\n",
+                (g_yaw_sgn > 0.0f) ? 1 : -1,
+                (g_yaw_sgn > 0.0f) ? "UP" : "DOWN");
+        break;
+    }
+
+    case 'B': {
+        /* B                    查看盲走预算与速度
+         * B <mm>               改盲走距离预算
+         * B <mm> <mm/s>        同时改盲走速度
+         *
+         * 盲走区的距离一变就要重新编译太慢，所以做成在线可调。
+         * 调法：先给一个小预算（600）确认走得直，再一档一档加到你量的缺口长度。
+         * 上限之所以重要：它是"真冲出去了还在往前开"的唯一保险，宁小勿大。 */
+        int32_t mm, vv, cm;
+        float   cv;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            fsm_get_blind(&cm, &cv);
+            app_log("[cli] blind max=%ld mm  v=%d mm/s\r\n", (long)cm, (int)cv);
+        } else {
+            mm = cli_num(&p); p = cli_skip(p);
+            vv = cli_num(&p);
+            fsm_get_blind(&cm, &cv);
+            fsm_set_blind((mm > 0) ? mm : cm, (vv > 0) ? (float)vv : cv);
+            fsm_get_blind(&cm, &cv);
+            app_log("[cli] set blind max=%ld mm  v=%d mm/s\r\n", (long)cm, (int)cv);
+        }
+        break;
+    }
+
+    case 'G': {
+        /* G                    查看断口里程窗
+         * G <d0> <d1>          设置窗口（相对"首次看到线"的里程，单位 mm）
+         * G 0 0                关闭
+         *
+         * 【必须在"跑"的状态下标定】电机驱动时会打滑（尤其每个直角弯的刹车相
+         * 和原地转），dist 比真实路径偏大：手推读到 7235 的地方，跑起来要读到
+         * 7692 以上才到。所以手推出来的数不能直接填进窗口。
+         *
+         * 标定方法：
+         *   1) G 0 0            先关掉，跑一圈
+         *   2) 车过断口、线刚消失那一刻发 v，记 dist -> A
+         *   3) 线重新出现那一刻再发 v，记 dist -> B
+         *   4) G <A-250> <B-100>
+         * d1 同时是"盲走出口放行"的界，所以取断口终点靠前 100 mm 留余量。 */
+        int32_t d0, d1;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            fsm_get_gap(&d0, &d1);
+            app_log("[cli] gap win=%ld..%ld mm%s\r\n", (long)d0, (long)d1,
+                    (d1 > d0) ? "" : "  (off)");
+        } else {
+            d0 = cli_num(&p); p = cli_skip(p);
+            d1 = cli_num(&p);
+            fsm_set_gap(d0, d1);
+            fsm_get_gap(&d0, &d1);
+            app_log("[cli] set gap win=%ld..%ld mm%s\r\n", (long)d0, (long)d1,
+                    (d1 > d0) ? "" : "  (off)");
+        }
+        break;
+    }
+
+    case 'Z': {
+        /* Z                     查看强制盲走状态
+         * Z <mm>                立刻强制盲走 mm 毫米，走完停车（不看线）
+         * Z 0                   取消
+         *
+         * 【为什么需要它】盲走一直没单独验过，而里程窗又依赖"跑的里程"标定，
+         * 两件事缠在一起，出了问题分不清是航向坏了还是窗口没对上。
+         * 这个命令把盲走拆出来：光地上把车摆正，发 Z 1500，量它走多直、走多远。
+         *
+         * 【顺带解决启动限制】正常启动（a）必须让 EL_START 看到线，所以光地上车不动。
+         * Z 会自己调 ctrl_start() 并跳过 EL_START 直接进 EL_BLIND，
+         * 因此在空地上也能跑 —— 这是它最实用的地方。
+         *
+         * 速度用 CFG_V_BLIND（B 命令可改），预算默认 1500 mm。 */
+        int32_t mm;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            mm = fsm_force_blind_left();
+            app_log("[cli] force blind %s  left=%ld mm\r\n",
+                    (mm > 0) ? "ON" : "off", (long)mm);
+        } else {
+            mm = cli_num(&p);
+            if (mm > 0) {
+                /* 顺序很重要：ctrl_start() 内部会调 fsm_arm()，而 fsm_arm 会清掉
+                 * 强制盲走标志。所以必须先启动，再下发预算。 */
+                if (ctrl_mode() == CAR_MODE_IDLE) ctrl_start();
+                fsm_force_blind(mm);
+                if (ctrl_mode() == CAR_MODE_IDLE) {
+                    app_log("[cli] force blind REJECTED (estop?) -- press KEY3 to clear\r\n");
+                } else {
+                    app_log("[cli] force blind %ld mm  (walks then stops)\r\n", (long)mm);
+                }
+            } else {
+                fsm_force_blind(0);
+                app_log("[cli] force blind off\r\n");
+            }
+        }
+        break;
+    }
+
+    case 'u': {
+        /* u            查看是否正在定角转弯
+         * u <deg>      以当前朝向为基准原地转 deg 度（正 = 右转），到位自动停
+         *
+         * 用途：单独验证"陀螺仪闭环转角"准不准 —— 这是直角弯元素的前置测试。
+         * TURN_KP / 到位门限 / 转弯速度都先在这里调好，再让状态机去用，
+         * 避免一上车就在赛道上试错。
+         * 安全：车必须架空或放空地，手不离急停（KEY3）。 */
+        int32_t deg;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            app_log("[cli] turn %s\r\n", ctrl_bench_turn_active() ? "ON" : "off");
+        } else {
+            deg = cli_num(&p);
+            if (deg >  180) deg =  180;
+            if (deg < -180) deg = -180;
+            ctrl_bench_turn((float)deg);
+            app_log("[cli] turn %ld deg ...\r\n", (long)deg);
+        }
+        break;
+    }
+
     case 'v':
+        /* vi = 视觉链路体检（小写别名，因为串口助手常把大写打不出来）。
+         * 大写 K 也做同样的事，但很多终端默认发小写，所以给个 vi。 */
+        if (*(p + 1) == 'i' || *(p + 1) == 'I') {
+            vision_t vv;
+            if (!bsp_vision_get(&vv)) {
+                app_log("[cli] vision: no frame yet\r\n");
+            } else {
+                app_log("[cli] visv valid=%u kind=%s x=%d tn=%d.%d tf=%d.%d xf=%u age=%lums\r\n",
+                        (unsigned)vv.valid, vis_flag_str(vv.flags), (int)vv.x,
+                        (int)(vv.angle / 10), (int)((vv.angle < 0 ? -vv.angle : vv.angle) % 10),
+                        (int)(vv.y / 10), (int)((vv.y < 0 ? -vv.y : vv.y) % 10),
+                        (unsigned)vv.label,
+                        (unsigned long)(HAL_GetTick() - vv.last_ms));
+                app_log("[cli] vis frames=%lu drop=%u crc_err=%lu\r\n",
+                        (unsigned long)vv.frames, (unsigned)vv.drop,
+                        (unsigned long)vv.crc_err);
+            }
+            break;
+        }
         if (st_snap(ctrl_shadow(), &st)) {
             app_log("[cli] mode=%u fault=%04X el=%u dist=%ld vbat=%umV ticks=%lu\r\n",
                     (unsigned)st.mode, (unsigned)st.fault,
@@ -624,6 +787,28 @@ static void cli_exec(void)
                 (unsigned)((HAL_GPIO_ReadPin(BT_STATE_GPIO_Port, BT_STATE_Pin) == GPIO_PIN_SET) ? 1u : 0u),
                 (unsigned long)bsp_uart_rx_total(&s_u_bt));
         break;
+
+    case 'K': {
+        /* K230 视觉链路体检。调视觉时用这个命令。
+         *   frames=0            → 一个字节都没收到（线没接 / 波特率不对 / K230 没在发）
+         *   frames 在涨但 valid=0 → 收到帧了，但没检测到线（阈值/画面问题）
+         *   quality 很低         → 检测到了但置信度差，要调摄像头或阈值 */
+        vision_t v;
+        if (!bsp_vision_get(&v)) {
+            app_log("[cli] vision: no frame yet\r\n");
+        } else {
+            app_log("[cli] visv valid=%u kind=%s x=%d tn=%d.%d tf=%d.%d xf=%u age=%lums\r\n",
+                    (unsigned)v.valid, vis_flag_str(v.flags), (int)v.x,
+                    (int)(v.angle / 10), (int)((v.angle < 0 ? -v.angle : v.angle) % 10),
+                    (int)(v.y / 10), (int)((v.y < 0 ? -v.y : v.y) % 10),
+                    (unsigned)v.label,
+                    (unsigned long)(HAL_GetTick() - v.last_ms));
+            app_log("[cli] vis frames=%lu drop=%u crc_err=%lu\r\n",
+                    (unsigned long)v.frames, (unsigned)v.drop,
+                    (unsigned long)v.crc_err);
+        }
+        break;
+    }
 
     case 'p':
         /* 输出侧体检：软件到底有没有把引脚驱动起来 */
@@ -804,6 +989,9 @@ static void comm_task(void *arg)
     uint32_t next_spd = 0u;
     uint32_t next_rate = 0u;
     uint32_t next_btdbg = 0u;
+    uint32_t next_elw = 0u;
+    uint32_t next_seek = 0u;
+    uint8_t  s_last_el = 0xFFu;
 
     (void)arg;
 
@@ -895,6 +1083,42 @@ static void comm_task(void *arg)
                 /* gr = gyro_right（右转为正）= -imu.gyro */
                 app_log("[j] %d %d %d\r\n",
                         (int)rs.w_ref_ddps, (int)(-rs.gyro_ddps), (int)rs.dv_mm);
+            }
+        }
+
+        /* 元素切换监视：状态机换了元素就打印一行。
+         * 调直角弯/盲走/环岛时靠这个看它到底进了哪个状态。
+         * 编号见 app_types.h 的 element_id_t：
+         *   0 NONE  1 START  2 STRAIGHT  3 CORNER  4 SCURVE  5 BLIND
+         *   6 LOOP_IN  7 LOOP_RUN  8 LOOP_OUT  9 CROSS  10 STOP  11 FAULT
+         *  12 TURN90  13 SEEK */
+        if ((uint32_t)(HAL_GetTick() - next_elw) >= 50u) {
+            car_state_t es;
+            next_elw = HAL_GetTick();
+            if (st_snap(ctrl_shadow(), &es) && es.element != s_last_el) {
+                s_last_el = es.element;
+                /* 带上"最后一次有效误差"、可见路数、和**当前航向**：
+                 * 判直角弯看 err_lv/cnt；看转弯转了多少度看前后两次 yaw 之差。 */
+                app_log("[el] %u  err_lv=%d mabs=%d vg=%u cnt=%u yaw=%d.%d slope=%d dist=%ld fault=%04X\r\n",
+                        (unsigned)es.element, (int)es.err_lv_x100,
+                        (int)(ctrl_pred_mabs() * 100.0f), (unsigned)ctrl_vis_gap(),
+                        (unsigned)es.track_count,
+                        (int)(es.yaw_ddeg / 10), (int)((es.yaw_ddeg < 0 ? -es.yaw_ddeg : es.yaw_ddeg) % 10),
+                        (int)(ctrl_pred_slope() * 1000.0f),
+                        (long)es.dist_mm,
+                        (unsigned)es.fault);
+            }
+        }
+
+        /* SEEK 期间跟踪：每 100 ms 打一次"可见路数/误差/已走里程"。
+         * 用来判断转完以后线到底在哪：cnt 一直是 0 说明线在车身后（冲过头了）。 */
+        if ((uint32_t)(HAL_GetTick() - next_seek) >= 100u) {
+            car_state_t ks;
+            next_seek = HAL_GetTick();
+            if (st_snap(ctrl_shadow(), &ks) && ks.element == 13u) {
+                app_log("[seek] cnt=%u err=%d dist=%ld\r\n",
+                        (unsigned)ks.track_count,
+                        (int)ks.line_err, (long)ks.dist_mm);
             }
         }
 

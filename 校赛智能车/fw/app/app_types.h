@@ -59,7 +59,11 @@ typedef enum {
     EL_LOOP_OUT,    /* 出口段 */
     EL_CROSS,
     EL_STOP,
-    EL_FAULT
+    EL_FAULT,
+    /* 2026-11-22 新增。**必须追加在末尾**，否则前面所有元素的编号都会变，
+     * 串口 `v` 里的 el、日志、以及文档里的对照表就全乱了。 */
+    EL_TURN90,      /* 直角弯：关循迹，按陀螺仪 yaw 定角转弯 */
+    EL_SEEK         /* 转完之后低速找线，锁线稳了才回 STRAIGHT */
 } element_id_t;
 
 /* ---------------- 状态快照 ---------------- */
@@ -74,6 +78,7 @@ typedef struct {
     uint8_t  track_raw;      /* 模块读回的原始字节 */
     int8_t   track_rc;       /* 上次 I2C 读取返回码（0 = 成功） */
     float    line_err;       /* 加权误差，权重单位 */
+    int16_t  err_lv_x100;   /* 最后一次有效线误差 ×100（丢线后仍保留） */
     uint8_t  line_valid;     /* 1 = 有效线 */
     int16_t  vis_x;          /* -1000..1000 */
     int16_t  vis_y;
