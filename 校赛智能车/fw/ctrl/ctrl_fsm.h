@@ -33,6 +33,10 @@ typedef struct {
                        * 实测 Z 1500 时 yaw 漂了 15°，横向 200 mm，就是这个原因。 */
     uint8_t w_mode;   /* 0 = 正常循迹 PD；1 = 角度环，用下面的 yaw_target */
     float yaw_target; /* w_mode=1 时的目标航向（°），-180..180，由 EL_TURN90 设置 */
+    uint8_t blind_lock; /* 1 = 这次盲走"写死航向"：进盲走那一刻把航向参考
+                       * 直接置成 yaw_target（= 发车航向 + CFG_BLIND_YAW_OFFSET），
+                       * 而不是当前朝向。只用在"数够 N 个直角弯之后那段固定盲走区"。
+                       * 好处：前面每个弯差 1° 的累积误差不会带进盲走。 */
 } fsm_out_t;
 
 void  fsm_init(void);
@@ -52,6 +56,15 @@ void  fsm_get_speeds(float *v_straight, float *v_corner);
 /* 盲走参数（serial 'B' 命令）。传 <=0 表示该项不改。 */
 void  fsm_set_blind(int32_t max_mm, float v);
 void  fsm_get_blind(int32_t *max_mm, float *v);
+
+/* ---- 转弯计数 + 模式判据（串口 'C'）----
+ * 赛道进盲走区之前是连续两个右转，所以判据是
+ * "已转弯数 >= min_turns 且最近两次都是 req_dir"，
+ * 命中后下一次丢线直接进盲走（写死航向）。 */
+void  fsm_set_turncount(int min_turns, int req_dir, int reset);
+void  fsm_get_turncount(int *cnt, int *min_turns, int *req_dir, int *used,
+                        int *h1, int *h2);
+float fsm_start_yaw(void);
 
 /* 断口里程窗（serial 'G' 命令）。d1 <= d0 表示关闭。
  * 注意：窗口必须用"跑"的里程标定，手推的数不能用 —— 电机驱动下的打滑

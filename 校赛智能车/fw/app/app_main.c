@@ -278,6 +278,8 @@ static void cli_help(void)
     app_log("[cli] c [kp kd vs vc] steering gains (x10) and straight/corner speeds\r\n");
     app_log("[cli] l [ratekp yawkp] rate loop gains (x100), -1 keeps\r\n");
     app_log("[cli] j            rate loop trace 50 ms (wref / gyro / dv)\r\n");
+    app_log("[cli] T [kp acc deg v brake inner]  turn params (kp x100, inner x100, -1 keeps)\r\n");
+    app_log("[cli] C [min dir]  turn counter; blind after min corners with last two = dir\r\n");
     app_log("[cli] o            speed trace 50 ms\r\n");
     app_log("[cli] b            key identify mode (report only, no action)\r\n");
     app_log("[cli] a            start (enter TRACK mode, same as start key)\r\n");
@@ -620,6 +622,97 @@ static void cli_exec(void)
             }
         }
         break;
+
+    case 'T': {
+        /* T                                        查看定角转弯参数
+         * T <kp×100> <acc> <deg> [v] [brake]        设置（传 -1 表示这一项不改）
+         * 例：T 200 300 95 0        kp=2.00 acc=300 deg=95° v=0（纯原地差速转）
+         *     T -1 -1 -1 20        只把转弯前进速度改成 20 mm/s
+         *     T -1 -1 -1 -1 60     只把进弯刹车相从 220 ms 改成 60 ms
+         *
+         * 【为什么加这个命令】转弯参数原来全是宏，改一次要重编 + 烧录 2 分钟，
+         * 而一次实车只能试 3~5 个弯，扫不动参数。现在一次编译、现场扫完。
+         *
+         * 【v 是关键】v 是转弯时两轮的中心速度：左轮 = v+dv、右轮 = v-dv。
+         *   v>0 时内轮目标可能落到 0 附近（低于死区）→ 只有一个轮子在推，
+         *        车以 R=v/ω 绕圈，车心横移出去，才需要"多转 15°"去够线。
+         *   v=0  时两轮变成 ±dv 对称反转 → 车心不动，转 90° 就对准新线。
+         * 先试 v=0；若尾段两轮都掉进死区导致"卡住不动"，再试 10 / 20。
+         *
+         * 【brake 是"进弯冲多远"的旋钮】丢线后要等 brake 这么久才开始转，
+         * 这段时间车还带着速度往前冲（300 mm/s × 0.34 s ≈ 100 mm），
+         * 冲出去的距离转 90° 之后**原封不动变成横向偏移** —— 这就是"车心往外溜"。
+         * 而转弯相本身 v=0、两轮对称，dist 不会涨，所以：
+         *   [el] 12→13 的 dist 差 ≈ 0  → 溜在"转之前"，把 brake 往小调（220→80→40）
+         *   [el] 12→13 的 dist 差还有几十毫米 → 溜在"转的过程"，查 v 和打滑
+         * brake 也不是越小越好：太小则车还带着 300 mm/s 就要求 ±420 差速，
+         * 速度环跟不上，行为时好时坏。60~120 一般是甜点。 */
+        float kp, acc, deg, v, bk, inner;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            ctrl_get_turn(&kp, &acc, &deg, &v, &bk, &inner);
+            app_log("[cli] turn kp=%d.%02d acc=%d deg=%d v=%d brake=%d inner=%d.%02d\r\n",
+                    (int)(kp * 100.0f + 0.5f) / 100, (int)(kp * 100.0f + 0.5f) % 100,
+                    (int)(acc + 0.5f), (int)(deg + 0.5f), (int)(v + 0.5f), (int)(bk + 0.5f),
+                    (int)(inner * 100.0f + 0.5f) / 100, (int)(inner * 100.0f + 0.5f) % 100);
+        } else {
+            int32_t a = cli_num(&p); p = cli_skip(p);
+            int32_t b = cli_num(&p); p = cli_skip(p);
+            int32_t c = cli_num(&p); p = cli_skip(p);
+            int32_t d = (*p == '\0') ? -1 : cli_num(&p); p = cli_skip(p);
+            int32_t e = (*p == '\0') ? -1 : cli_num(&p); p = cli_skip(p);
+            int32_t f = (*p == '\0') ? -1 : cli_num(&p);
+            ctrl_set_turn((a >= 0) ? (float)a / 100.0f : -1.0f,
+                          (b >= 0) ? (float)b : -1.0f,
+                          (c >= 0) ? (float)c : -1.0f,
+                          (d >= 0) ? (float)d : -1.0f,
+                          (e >= 0) ? (float)e : -1.0f,
+                          (f >= 0) ? (float)f / 100.0f : -1.0f);
+            ctrl_get_turn(&kp, &acc, &deg, &v, &bk, &inner);
+            app_log("[cli] set turn kp=%d.%02d acc=%d deg=%d v=%d brake=%d inner=%d.%02d\r\n",
+                    (int)(kp * 100.0f + 0.5f) / 100, (int)(kp * 100.0f + 0.5f) % 100,
+                    (int)(acc + 0.5f), (int)(deg + 0.5f), (int)(v + 0.5f), (int)(bk + 0.5f),
+                    (int)(inner * 100.0f + 0.5f) / 100, (int)(inner * 100.0f + 0.5f) % 100);
+        }
+        break;
+    }
+
+    case 'C': {
+        /* C                      查看转弯计数与模式
+         * C 0                    计数清零（重跑一圈）
+         * C <min>                改"至少转过几个弯"，同时清零
+         * C <min> <dir>          再加方向约束：dir=+1 要求最后两个都是右转，
+         *                        -1 左转，0 不限方向。例：C 5 1
+         *
+         * 【判据是"模式"不是"第几个"】赛道进盲走区之前是连续两个右转，
+         * 转完几乎马上就到断口。所以判定条件是：
+         *     已转弯数 >= min  且  最近两次转弯方向都 == dir
+         * 这样即使漏识别一两个弯（只认出 5 个），只要最后两个是右右，照样触发。
+         *
+         * 备选判据的毛病：灰度在断口/直角弯上区间重叠（前六轮已证失败）；
+         * 里程每个弯打滑累积 6%，跑起来比手推多 450 mm。
+         *
+         * 触发后那次盲走会把航向**写死**成"发车方向 + 180°"
+         * （CFG_BLIND_YAW_OFFSET），前面每个弯差 1° 的累积误差不会带进盲走。
+         * 只触发一次；结束后恢复原来的判据。 */
+        int cnt, mn, rd, used, h1, h2;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            float sy = fsm_start_yaw();
+            fsm_get_turncount(&cnt, &mn, &rd, &used, &h1, &h2);
+            app_log("[cli] turns=%d/%d req_dir=%d last=[%d,%d] blind_used=%d start_yaw=%d\r\n",
+                    cnt, mn, rd, h1, h2, used,
+                    (int)(sy + ((sy < 0.0f) ? -0.5f : 0.5f)));
+        } else {
+            int32_t n = cli_num(&p); p = cli_skip(p);
+            int32_t d = (*p == '\0') ? -2 : cli_num(&p);   /* -2 = 不改方向约束 */
+            fsm_set_turncount((n > 0) ? (int)n : 0, (int)d, 1);
+            fsm_get_turncount(&cnt, &mn, &rd, &used, &h1, &h2);
+            app_log("[cli] set turns=%d/%d req_dir=%d blind_used=%d\r\n",
+                    cnt, mn, rd, used);
+        }
+        break;
+    }
 
     case 'Y': {
         /* Y      翻转航向符号（右转时 yaw 是变大还是变小），现场定符号用
@@ -992,6 +1085,7 @@ static void comm_task(void *arg)
     uint32_t next_elw = 0u;
     uint32_t next_seek = 0u;
     uint8_t  s_last_el = 0xFFu;
+    uint32_t s_el_t0 = 0u;      /* 上一个元素是在什么时候进的，用来算 dt */
 
     (void)arg;
 
@@ -1096,17 +1190,33 @@ static void comm_task(void *arg)
             car_state_t es;
             next_elw = HAL_GetTick();
             if (st_snap(ctrl_shadow(), &es) && es.element != s_last_el) {
+                uint32_t now_el = HAL_GetTick();
+                uint32_t dt_el  = (s_last_el == 0xFFu) ? 0u : (now_el - s_el_t0);
+                s_el_t0   = now_el;
                 s_last_el = es.element;
                 /* 带上"最后一次有效误差"、可见路数、和**当前航向**：
-                 * 判直角弯看 err_lv/cnt；看转弯转了多少度看前后两次 yaw 之差。 */
-                app_log("[el] %u  err_lv=%d mabs=%d vg=%u cnt=%u yaw=%d.%d slope=%d dist=%ld fault=%04X\r\n",
+                 * 判直角弯看 err_lv/cnt；看转弯转了多少度看前后两次 yaw 之差。
+                 * dt = 上一个元素停留了多久：EL_TURN90 的 dt 就是整个转弯耗时
+                 * （含刹车相 + 角度环），配合 dist 差能直接判断"溜在转之前还是转之中"。 */
+                app_log("[el] %u  err_lv=%d mabs=%d vg=%u cnt=%u yaw=%d.%d slope=%d dist=%ld dt=%lu raw=%02X fault=%04X\r\n",
                         (unsigned)es.element, (int)es.err_lv_x100,
                         (int)(ctrl_pred_mabs() * 100.0f), (unsigned)ctrl_vis_gap(),
                         (unsigned)es.track_count,
                         (int)(es.yaw_ddeg / 10), (int)((es.yaw_ddeg < 0 ? -es.yaw_ddeg : es.yaw_ddeg) % 10),
                         (int)(ctrl_pred_slope() * 1000.0f),
                         (long)es.dist_mm,
+                        (unsigned long)dt_el,
+                        (unsigned)es.track_raw,
                         (unsigned)es.fault);
+                /* 进直角弯时单独打一行：序号 + 方向历史（+1 右 / -1 左）。
+                 * 跑一圈就能核对"数到几个"、"最后两个是不是右右"，
+                 * 因为进盲走的判据正是"数够 N 个 且 最后两个同向"。 */
+                if (es.element == 12u) {
+                    int tc, tm, tr, td, th1, th2;
+                    fsm_get_turncount(&tc, &tm, &tr, &td, &th1, &th2);
+                    app_log("[turn] #%d/%d dir=%d seq=[%d,%d]\r\n",
+                            tc, tm, th1, th2);
+                }
             }
         }
 

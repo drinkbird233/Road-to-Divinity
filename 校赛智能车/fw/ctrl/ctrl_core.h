@@ -57,6 +57,28 @@ void  ctrl_set_steer(float kp, float kd);
 /* 运行时改角速度内环增益（传负值表示不改该项） */
 void  ctrl_set_rate(float rate_kp, float yaw_kp);
 
+/* ---- 定角转弯的在线参数（T 命令） ----
+ * kp : 角度环比例增益 [°/s per °]
+ * acc: 刹车曲线的等效角加速度 [°/s²]，越大越快、越大越容易过冲
+ * deg: 目标转角 [°]，EL_TURN90 进弯时读它
+ * v  : 转弯前进速度 [mm/s]，0 = 纯原地差速转（两轮 ±dv 对称反转）
+ * brake_ms : 进弯刹车相时长 [ms]，越长越稳但冲得越远
+ * inner    : 内轮差速倍率，>1 让内轮多转（默认 1.0 = 对称）
+ * 六项都是"传负值不改"，但 v=0 是有效值。 */
+void  ctrl_set_turn(float kp, float acc, float deg, float v, float brake_ms, float inner);
+void  ctrl_get_turn(float *kp, float *acc, float *deg, float *v, float *brake_ms, float *inner);
+
+/* 直接指定航向参考（锁死盲走用） */
+void  ctrl_set_yaw_ref(float yaw_deg);
+
+/* 定义在 ctrl_core.c，ctrl_fsm 直接读（与 g_yaw_sgn 同一个风格） */
+extern float g_turn_kp;
+extern float g_turn_acc;
+extern float g_turn_deg;
+extern float g_turn_v;
+extern float g_turn_brake;
+extern float g_turn_inner;
+
 /* 补线斜率（err/mm）：状态机用它区分弯道和断口 */
 float ctrl_pred_slope(void);
 /* 历史窗口内的平均 |误差|：断口≈0，弯道>0.5 */

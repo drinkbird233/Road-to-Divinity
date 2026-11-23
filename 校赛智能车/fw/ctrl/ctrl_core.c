@@ -31,6 +31,16 @@
 static car_state_shadow_t s_sh;
 static car_params_t       s_p;
 
+/* ---- 定角转弯的在线参数（T 命令改；默认值来自 app_config.h） ----
+ * 放在这里而不是宏里，是为了现场扫参数不用反复编译：
+ * 每改一次宏要重编 + 烧录约 2 分钟，而一次实车只能试 3~5 个弯。 */
+float g_turn_kp  = CFG_TURN_KP;
+float g_turn_acc = CFG_TURN_ACC;   /* 刹车曲线的等效角加速度 [°/s²] */
+float g_turn_deg = CFG_TURN_DEG;   /* 目标转角 [°]，ctrl_fsm 进弯时读 */
+float g_turn_v   = CFG_V_TURN;     /* 转弯前进速度 [mm/s]，0 = 纯原地差速转 */
+float g_turn_brake = (float)CFG_TURN_BRAKE_MS; /* 进弯刹车相时长 [ms] */
+float g_turn_inner = CFG_TURN_INNER; /* 内轮差速倍率，1.0 = 对称，>1 = 内轮多转 */
+
 static pid_t   s_pid_l;
 static pid_t   s_pid_r;
 
@@ -137,6 +147,30 @@ static float wrap180f(float d)
     while (d >  180.0f) d -= 360.0f;
     while (d < -180.0f) d += 360.0f;
     return d;
+}
+
+/* 定角转弯的角速度指令（台架 u 命令与 EL_TURN90 共用这一份，保证"台架调出来的
+ * 数上车就是同一个行为"）。
+ *
+ *   w = sgn * max( KP*|dh| , sqrt(2*A*|dh|) )，截到 ±W_MAX
+ *
+ * 为什么需要 sqrt 这一项：纯 P 在尾段把指令压到 10 °/s 上下，差速 13 mm/s
+ * 已经低于电机死区（60），轮子推不动，实测最后 10° 要磨 1.2 s。
+ * sqrt 是"以恒定角加速度 A 刹向目标"的速度曲线，越接近目标降得越缓，
+ * 既能把尾段顶出死区，又天然不会在目标前还保持高速（不需要微分项）。
+ *
+ * dh 为 0 时两项都是 0，所以不会自激。 */
+static float turn_rate_cmd(float dh, float sgn)
+{
+    float adh = fabsf(dh);
+    float wp  = g_turn_kp * adh;
+    float wbr = sqrtf(2.0f * g_turn_acc * adh);
+    float wm  = (wbr > wp) ? wbr : wp;
+
+    if (wm >  CFG_W_MAX) wm =  CFG_W_MAX;
+    if (wm < -CFG_W_MAX) wm = -CFG_W_MAX;
+
+    return (dh >= 0.0f) ? (sgn * wm) : (-sgn * wm);
 }
 
 car_state_shadow_t *ctrl_shadow(void) { return &s_sh; }
@@ -377,6 +411,32 @@ void ctrl_set_rate(float rate_kp, float yaw_kp)
     if (yaw_kp  >= 0.0f) s_p.yaw_hold_kp = yaw_kp;
 }
 
+/* 在线改定角转弯的六个参数。传负值表示"这一项不改"。
+ * 注意 v 传 0 是**有效值**（纯原地差速转），不要用 0 表示"不改"。 */
+void ctrl_set_turn(float kp, float acc, float deg, float v, float brake_ms, float inner)
+{
+    if (kp  >= 0.0f) g_turn_kp  = kp;
+    if (acc >= 0.0f) g_turn_acc = acc;
+    if (deg >= 0.0f) g_turn_deg = deg;
+    if (v   >= 0.0f) g_turn_v   = v;
+    if (brake_ms >= 0.0f) g_turn_brake = brake_ms;
+    if (inner    >= 0.0f) g_turn_inner = inner;
+}
+
+void ctrl_get_turn(float *kp, float *acc, float *deg, float *v, float *brake_ms, float *inner)
+{
+    if (kp)  *kp  = g_turn_kp;
+    if (acc) *acc = g_turn_acc;
+    if (deg) *deg = g_turn_deg;
+    if (v)   *v   = g_turn_v;
+    if (brake_ms) *brake_ms = g_turn_brake;
+    if (inner)    *inner    = g_turn_inner;
+}
+
+/* 直接指定航向参考。锁死盲走用：进盲走那一刻把参考置成绝对目标
+ * （发车航向 + 180），之后再靠航向保持把它拉住。 */
+void ctrl_set_yaw_ref(float yaw_deg) { s_yaw_ref = yaw_deg; }
+
 /* 台架诊断：把速度环 PID 的内部状态暴露出来。
  * 积分项 i_acc 是关键——如果稳态误差存在而 i_acc 不涨，说明积分被卡住了。 */
 float ctrl_pid_iacc_l(void)  { return s_pid_l.i_acc; }
@@ -503,7 +563,14 @@ void ctrl_step(void)
      * 换状态时重置一次，代价很小，收益是把这个跳变彻底消掉。 */
     if ((uint8_t)fo->el != s_el_prev) {
         s_el_prev = (uint8_t)fo->el;
-        s_yaw_ref = s_imu.yaw_deg;
+        /* 写死航向的盲走：参考直接用绝对目标（发车方向 + 180），
+         * 而不是"当前朝向"。这样前 7 个直角弯每次差 1° 的累积误差
+         * 不会带进 1.5 m 的盲走段。 */
+        if (fo->blind_lock) {
+            s_yaw_ref = fo->yaw_target;
+        } else {
+            s_yaw_ref = s_imu.yaw_deg;
+        }
     }
 
     /* ---------------- 3.5 台架模式：直接输出占空比，跳过所有控制 ---------------- */
@@ -555,13 +622,13 @@ void ctrl_step(void)
     if (s_turn) {
         float gy  = imu_ok ? -lpf1_step(&s_lpf_gyro, s_imu.gyro_dps) : 0.0f;
         float dh  = wrap180f(s_turn_target - s_imu.yaw_deg);
-        float w   = clampf(g_yaw_sgn * CFG_TURN_KP * dh, -CFG_W_MAX, CFG_W_MAX);
+        float w   = turn_rate_cmd(dh, g_yaw_sgn);
         float dvt = clampf(CFG_RATE_FF * w + s_p.rate_kp * (w - gy),
                            -CFG_DV_MAX, CFG_DV_MAX);
 
         bsp_motor_enable(true);
-        vl_ref = clampf(CFG_V_TURN + dvt, -s_p.v_max, s_p.v_max);
-        vr_ref = clampf(CFG_V_TURN - dvt, -s_p.v_max, s_p.v_max);
+        vl_ref = clampf(g_turn_v + dvt, -s_p.v_max, s_p.v_max);
+        vr_ref = clampf(g_turn_v - dvt, -s_p.v_max, s_p.v_max);
         duty_l = s_p.speed_ff * vl_ref + pid_step(&s_pid_l, vl_ref, s_v_meas_l, dt);
         duty_r = s_p.speed_ff * vr_ref + pid_step(&s_pid_r, vr_ref, s_v_meas_r, dt);
         bsp_motor_set(duty_l, duty_r);
@@ -652,7 +719,8 @@ void ctrl_step(void)
          * 这一支必须**跳过** PD、视觉前馈、航向保持 —— 三个源同时往里加会互相打架，
          * 而且此时车本来就看不到线（line_ok=0），循迹项全是噪声。 */
         float dh_t = wrap180f(fo->yaw_target - s_imu.yaw_deg);
-        w_ref    = clampf(g_yaw_sgn * CFG_TURN_KP * dh_t, -CFG_W_MAX, CFG_W_MAX);
+
+        w_ref    = turn_rate_cmd(dh_t, g_yaw_sgn);
         s_e_prev = e_f;         /* 保持微分历史连续，退出角度环那一刻不会打突 */
     } else {
         /* PD：比例项负责"纠偏"，微分项负责"预判"。
@@ -719,8 +787,33 @@ void ctrl_step(void)
         vl_ref = (float)s_remote_l;
         vr_ref = (float)s_remote_r;
     } else {
-        vl_ref = v_cmd + dv;
-        vr_ref = v_cmd - dv;
+        /* 【内轮倍率】w_mode=1（定角转弯）时，内轮那一侧再多给 g_turn_inner 倍的差速。
+         *
+         * 为什么需要：v=0 时两轮目标严格对称（+dv / -dv），但内轮是"逆向走"，
+         * 要克服整车旋转惯量 + 静摩擦 + 减速箱反向间隙，实际转速往往跟不上，
+         * 表现就是"绕外轮转"，车心画一段小圆弧。
+         * 给内轮额外倍率等于单独给它加力矩，让它真正咬住。
+         *
+         * 代价：两轮不再对称，平均速度 = v - dv*(inner-1)/2 ≠ v，会产生一点
+         * 后退分量（车心朝车尾方向偏）。inner 越大这个分量越大，所以别超过 1.5。
+         * 默认 1.0 = 与原来完全一致。 */
+        float dvo = dv;                    /* 外轮那一侧的差速 */
+        float dvi = dv;                    /* 内轮那一侧的差速 */
+
+        if (fo->w_mode == 1u && g_turn_inner > 1.0f) {
+            dvi = dv * g_turn_inner;
+            if (dvi >  CFG_DV_MAX) dvi =  CFG_DV_MAX;
+            if (dvi < -CFG_DV_MAX) dvi = -CFG_DV_MAX;
+        }
+        /* 用 w_ref 的符号判断"往哪边转"，不要用 dv —— dv 含陀螺仪反馈项，
+         * 极端滞后时符号可能瞬时反向，会把内外轮搞反。 */
+        if (w_ref >= 0.0f) {               /* 右转：左外右内 */
+            vl_ref = v_cmd + dvo;
+            vr_ref = v_cmd - dvi;
+        } else {                           /* 左转：右外左内 */
+            vl_ref = v_cmd + dvi;
+            vr_ref = v_cmd - dvo;
+        }
     }
     vl_ref = clampf(vl_ref, -s_p.v_max, s_p.v_max);
     vr_ref = clampf(vr_ref, -s_p.v_max, s_p.v_max);

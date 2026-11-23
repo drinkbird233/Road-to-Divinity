@@ -25,6 +25,10 @@
 extern float ctrl_pred_slope(void);
 extern float ctrl_pred_mabs(void);
 extern uint8_t ctrl_vis_gap(void);
+/* 定角转弯的在线参数（T 命令改，定义在 ctrl_core.c） */
+extern float g_turn_deg;
+extern float g_turn_v;
+extern float g_turn_brake;
 #include "app_config.h"
 #include "pid.h"
 
@@ -54,7 +58,10 @@ typedef struct {
 
 static const loop_cfg_t s_loop_tbl[2] = {
     { CFG_V_LOOP_CIRCLE, 330.0f, 4000u },   /* LOOP_CIRCLE：圆形环岛 */
-    { CFG_V_LOOP_HEX,    360.0f, 6000u }    /* LOOP_HEX：六边形环岛，必须整圈 */
+    /* 六边形要绕满 360°：按边长 300 mm、周长约 1.8 m、180 mm/s 算需要约 10 s，
+     * 原来的 6 s 会在绕完之前就把车踢出去（表现为"环岛里走一半就直冲"）。
+     * 这里的超时只是兜底，正常情况下由 exit_deg=360° 收尾。 */
+    { CFG_V_LOOP_HEX,    360.0f, 12000u }
 };
 
 static fsm_out_t s_o;
@@ -119,6 +126,26 @@ static float     s_err_lv;       /* 最后一次「有效」误差。
                                   * 丢线时 bsp_track 会把 err 清成 0，拿它判方向
                                   * 会永远判成"居中"，所以必须单独记一份。 */
 
+/* ---- 转弯计数 → 自动进盲走（2026-11-23 新增） ----
+ * 赛道结构：一圈 7 个直角弯，最后两个是连续右转，之后就是 1.5 m 的断口盲走区。
+ * 所以"数到第 7 个弯"是比任何灰度判据都可靠的"该进盲走了"的信号。
+ *
+ * 为什么用计数而不是里程：里程会因打滑累积 6% 误差（实测手推 7235 处，
+ * 跑起来要到 7692），而转弯次数是离散的、不会漂。 */
+static uint8_t   s_turn_cnt;     /* 已经转完的直角弯个数 */
+static uint8_t   s_blind_done;   /* 计数触发的盲走是否已经用掉（只触发一次） */
+static uint8_t   s_blind_lock;   /* 1 = 这次盲走写死航向（用发车方向+180） */
+static float     s_start_yaw;    /* 发车时的航向，盲走目标 = 它 + CFG_BLIND_YAW_OFFSET */
+static int8_t    s_dir_h1;       /* 最近一次转弯方向：+1 右 / -1 左 */
+static int8_t    s_dir_h2;       /* 上一次转弯方向 */
+
+/* 进盲走的"模式"判据：
+ *   已转弯数 >= s_blind_min_cnt  且  最近两次转弯方向都 == s_blind_req_dir
+ * 比"固定第 7 个"好在：漏识别一两个弯也能触发，只要最后两个是右右。
+ * 两个都用 float/int 存，方便 C 命令在线改；min<=0 表示关闭。 */
+static float     s_blind_min_cnt = (float)CFG_BLIND_MIN_TURNS;
+static int8_t    s_blind_req_dir = (int8_t)CFG_BLIND_REQ_DIR;
+
 static float wrap180f(float d)
 {
     while (d >  180.0f) d -= 360.0f;
@@ -136,6 +163,7 @@ static void enter(element_id_t el, int32_t d, float yaw, uint32_t t)
         s_gap_mileage  = 0u;
         s_blind_forced = 0u;
         s_force_blind_mm = 0;
+        s_blind_lock   = 0u;   /* 写死航向只对"那一次"盲走有效 */
     }
     s_o.el    = el;
     s_t_enter = t;
@@ -156,12 +184,17 @@ static void enter(element_id_t el, int32_t d, float yaw, uint32_t t)
 static void enter_turn(element_id_t el, int32_t d, float yaw, uint32_t t, float dir)
 {
     enter(el, d, yaw, t);
+    /* 数弯 + 记方向历史：每次真的进 EL_TURN90 才计一次
+     * （EL_CORNER 和 EL_STRAIGHT 两条入口都经过这里）。 */
+    if (s_turn_cnt < 250u) s_turn_cnt++;
+    s_dir_h2 = s_dir_h1;
+    s_dir_h1 = (dir >= 0.0f) ? 1 : -1;
     s_turn_dir     = (dir >= 0.0f) ? 1.0f : -1.0f;
     s_scan_back    = 0u;
     s_turn_start   = yaw;               /* 记下起始航向，用来算"已经转过多少" */
     /* 目标角 = 当前航向 + 符号 * 方向 * 90。
      * 符号不可省：右转时 yaw 到底是变大还是变小取决于模块约定（g_yaw_sgn）。 */
-    s_turn_target  = wrap180f(yaw + g_yaw_sgn * s_turn_dir * CFG_TURN_DEG);
+    s_turn_target  = wrap180f(yaw + g_yaw_sgn * s_turn_dir * g_turn_deg);
     s_o.w_mode     = 1u;
     s_o.yaw_target = s_turn_target;
 }
@@ -191,6 +224,13 @@ void fsm_init(void)
     s_err_lv = 0.0f;
     s_o.w_mode = 0u;
     s_o.yaw_target = 0.0f;
+    s_o.blind_lock = 0u;
+    s_turn_cnt   = 0u;
+    s_blind_done = 0u;
+    s_blind_lock = 0u;
+    s_start_yaw  = 0.0f;
+    s_dir_h1     = 0;
+    s_dir_h2     = 0;
 }
 
 void fsm_arm(void)
@@ -210,6 +250,11 @@ void fsm_arm(void)
     s_gap_mileage = 0u;     /* 新的一圈：里程窗锁定标志必须清掉 */
     s_blind_forced = 0u;    /* 强制盲走也必须由新的 Z 命令重新设置 */
     s_force_blind_mm = 0;
+    s_turn_cnt   = 0u;      /* 新的一圈重新数直角弯 */
+    s_blind_done = 0u;
+    s_blind_lock = 0u;
+    s_dir_h1     = 0;
+    s_dir_h2     = 0;
 }
 
 void fsm_stop(void)
@@ -281,6 +326,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
      * 放在这里统一清，而不是每个 case 里各清一次 —— 漏清一个状态就会永久卡在角度环。 */
     s_o.w_mode = 0u;
     s_o.yaw_hard = 0u;   /* 同上：只有确定没线的元素（断口/强制盲走）才会置 1 */
+    s_o.blind_lock = 0u; /* 同上：只有"数够 N 个弯"触发的那次盲走才置 1 */
 
     /* 记录最后一次「有效」误差：丢线时 trk->err 已经被 bsp_track 清成 0，
      * 直接拿它判断"往哪边转"会永远得到 0，也就是永远判成居中丢线。 */
@@ -343,6 +389,10 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
              * 用相对里程而不是上电绝对里程：这样"车摆在哪、什么时候按 a"都不影响，
              * 换起点只要重新测一次窗口。 */
             s_d_run0 = dist_mm;
+            /* 【发车航向】盲走的绝对目标 = 它 + CFG_BLIND_YAW_OFFSET。
+             * 在这里记而不是 fsm_arm()：arm 只是按下启动键，车可能还没摆正；
+             * 而"看到线"这一刻车已经在起跑线上、方向是最终的。 */
+            s_start_yaw = yaw;
             enter(EL_STRAIGHT, dist_mm, yaw, tick_ms);
         }
         break;
@@ -402,6 +452,39 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
                  * 这是"弯道冲出去"的直接原因之一。 */
             }
             if (tick_ms - s_t_lost >= CFG_BLIND_ARM_MS) {
+
+                /* ===== 【转弯模式 → 进盲走 · 最高优先级】=====
+                 * 赛道进盲走区之前是**连续两个右转**，转完几乎马上就到断口。
+                 * 所以判据用"模式"而不是"第几个"：
+                 *   已转弯数 >= CFG_BLIND_MIN_TURNS  且  最近两次都是右转
+                 * 好处：漏识别一两个弯也能触发（只认出 5 个也照样进盲走）。
+                 * 备选判据的毛病：灰度在断口/直角弯上区间重叠（前六轮已证失败）；
+                 * 里程每个弯打滑累积 6%，跑起来比手推多 450 mm。
+                 * 只触发一次，之后恢复原来的判据。 */
+                {
+                    uint8_t seq_ok = 1u;
+
+                    if (s_blind_req_dir != 0) {
+                        seq_ok = (uint8_t)((s_dir_h1 == s_blind_req_dir &&
+                                            s_dir_h2 == s_blind_req_dir) ? 1u : 0u);
+                    }
+                    if (s_blind_min_cnt >= 0.5f && !s_blind_done && seq_ok &&
+                        (float)s_turn_cnt >= s_blind_min_cnt) {
+                        s_blind_done = 1u;
+                        s_blind_lock = 1u;      /* 写死航向：发车方向 + 180 */
+                        s_d_blind    = dist_mm;
+                        /* ⚠️ 必须在这里就把标志写进 s_o，不能等 case EL_BLIND：
+                         * 下面 enter() 之后立刻 break，本次 tick **不会**执行
+                         * case EL_BLIND 的代码；而 ctrl_core 正是在"元素切换的那一拍"
+                         * 读 blind_lock 决定航向参考用绝对角还是当前角。 */
+                        s_o.blind_lock = 1u;
+                        s_o.yaw_hard   = 1u;
+                        s_o.kp_scale   = 0.0f;
+                        s_o.yaw_target = wrap180f(s_start_yaw + CFG_BLIND_YAW_OFFSET);
+                        enter(EL_BLIND, dist_mm, yaw, tick_ms);
+                        break;
+                    }
+                }
 
                 /* ===== 【里程窗】断口位置固定，用"自起跑以来的里程"分流 =====
                  * 为什么要有这一条：直角弯和断口在 8 路上是同一件事（都是丢线），
@@ -537,6 +620,18 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
         s_o.yaw_hard = (uint8_t)((s_blind_forced || s_gap_mileage) ? 1u : 0u);
         set_speed_target(s_v_blind);
 
+        /* 【写死航向的盲走】数够 N 个直角弯之后那次。
+         * 地上是一片空白，残留假线只会把方向盘带歪，所以位置环直接关掉，
+         * 目标航向用绝对角度（发车方向 + 180），不用"进弯时的当前朝向" ——
+         * 这样前 7 个弯每次差 1° 的累积误差不会被带进这 1.5 m。
+         * 值的写入在 ctrl_core 的元素切换处（只在切换那一刻生效一次）。 */
+        if (s_blind_lock) {
+            s_o.kp_scale   = 0.0f;
+            s_o.yaw_hard   = 1u;
+            s_o.blind_lock = 1u;
+            s_o.yaw_target = wrap180f(s_start_yaw + CFG_BLIND_YAW_OFFSET);
+        }
+
         /* 【强制盲走 · 出口】Z 模式不看线，走够距离就停车。
          * 停而不是继续，是为了让你能下车量横向偏差 ——
          * 这是唯一能判断"航向保持到底行不行"的客观数据。 */
@@ -565,8 +660,57 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
         }
 
         if (line && gap_ready) {
+            /* 【环岛入口快判】盲走区后面直接接环岛时，线一出现就贴在某一侧。
+             * 不在这里接住的话，车会先沿盲走方向直冲 45~90 mm，
+             * 等 EL_STRAIGHT 攒够 150 ms 才确认，很可能已错过入口切线。
+             *
+             * 判据与 EL_STRAIGHT 里的环岛入口完全一致（贴边 + ≥4 路），
+             * 所以误判概率与原来一样；线居中时仍然回 STRAIGHT，行为不变。 */
+            uint8_t side_loop = 0u;
+
+            if (CFG_BLIND_NEXT_LOOP != 0) {
+#if CFG_BLIND_LOOP_FORCE
+                /* 强制模式：看到线就认环岛。
+                 * 实测第一次"没切进去"就是因为形状判据要 4 路同时贴边，
+                 * 而线刚从断口边缘冒出来时通常只有 2~3 路。
+                 * 仍要求 ≥2 路：断口里偶尔会有 1 路反光被当成线，
+                 * 那一路不能把车诱进环岛逻辑。 */
+                side_loop = (uint8_t)((trk && trk->count >= 2u) ? 1u : 0u);
+#else
+                if (trk && (trk->count >= FSM_LOOP_SIDE_CNT) &&
+                    ((trk->left_edge == 0 && trk->right_edge < 6) ||
+                     (trk->right_edge == 7 && trk->left_edge > 1))) {
+                    side_loop = 1u;
+                }
+#endif
+            }
+
             if (++s_relock >= FSM_RELOCK_CYCLES) {
-                enter(EL_STRAIGHT, dist_mm, yaw, tick_ms);
+                if (side_loop) {
+                    /* 环岛在哪一侧：优先用"哪一路贴在边沿"判断，比 err 可靠 ——
+                     * 线刚出现那一拍 err 可能还很小（接近 0），符号是随机的，
+                     * 偏置方向一旦反了，车会直接朝外圈甩出去。 */
+                    float bias_sgn = 0.0f;
+
+                    if (trk) {
+                        if ((trk->left_edge == 0) && (trk->right_edge != 7)) {
+                            bias_sgn = -1.0f;      /* 线在左 → 环岛在左 */
+                        } else if ((trk->right_edge == 7) && (trk->left_edge != 0)) {
+                            bias_sgn =  1.0f;      /* 线在右 → 环岛在右 */
+                        }
+                    }
+                    if (bias_sgn == 0.0f) {
+                        bias_sgn = (err < 0.0f) ? -1.0f : 1.0f;   /* 兜底 */
+                    }
+
+                    s_loop_kind = (CFG_BLIND_NEXT_LOOP == 2) ? LOOP_CIRCLE : LOOP_HEX;
+                    s_yaw_acc   = 0.0f;          /* 从这里开始累计绕圈角度 */
+                    s_d_loop    = dist_mm;
+                    s_o.e_bias  = bias_sgn * FSM_LOOP_BIAS;
+                    enter(EL_LOOP_IN, dist_mm, yaw, tick_ms);
+                } else {
+                    enter(EL_STRAIGHT, dist_mm, yaw, tick_ms);
+                }
                 break;
             }
         } else {
@@ -698,7 +842,9 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
     /* ================= 直角弯：陀螺仪定角转弯 =================
      * 不用 8 路位置项（kp_scale=0），改为 w_mode=1，让 ctrl_core 用
      *   w_ref = TURN_KP * wrap180(yaw_target - yaw)
-     * 直接给角速度目标。速度降到 CFG_V_TURN，让转弯半径尽量小。
+     * 直接给角速度目标。前进速度用 g_turn_v（默认 0 = 两轮 ±dv 对称反转，
+     * 纯原地转，车心不动），这样转完 90° 车还在路口，新线仍在视野边缘，
+     * 不需要靠"多转 15° 斜插"去补位（见 app_config.h 里 CFG_V_TURN 的说明）。
      * 到位判据用"|dh| < TOL 且连续保持 SETTLE_MS"，单看瞬时值会被过冲骗过去。 */
     case EL_TURN90: {
         float dh = wrap180f(s_o.yaw_target - yaw);
@@ -712,7 +858,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
          * 所以表现为"有时候转得很准，有时候慢悠悠冲过头"。
          *
          * 加一个固定的刹车时间，让每次转弯都从 v≈0 开始，行为就一致了。 */
-        if ((uint32_t)(tick_ms - s_t_enter) < CFG_TURN_BRAKE_MS) {
+        if ((uint32_t)(tick_ms - s_t_enter) < (uint32_t)g_turn_brake) {
             s_o.w_mode   = 0u;      /* 不转 */
             s_o.kp_scale = 0.0f;    /* 也不用位置环 */
             set_speed_target(0.0f); /* 刹停 */
@@ -735,7 +881,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
         s_o.yaw_hold   = 0u;
         s_o.w_mode     = 1u;
         s_o.yaw_target = s_scan_back ? s_turn_start : s_turn_target;
-        set_speed_target(CFG_V_TURN);
+        set_speed_target(g_turn_v);
 
         /* 到位判据：角度进容差 **而且** 角速度已经降下来。
          * 只看角度的话，车还在以 200 °/s 冲过目标时 |dh| 也会短暂落在容差内，
@@ -902,3 +1048,36 @@ int32_t fsm_force_blind_left(void)
 
 /* 最后一次有效线误差（丢线后仍保留） */
 float fsm_err_lv(void) { return s_err_lv; }
+
+/* ---------------- 转弯计数（串口 'C' 命令） ----------------
+ * 赛道一圈 7 个直角弯，转够之后下一次丢线就是断口盲走区，
+ * 所以"C 命令"既是查看进度，也是标定"在哪个弯之后进盲走"。
+ *
+ * reset != 0 → 计数清零（新的一圈）
+ * after >  0 → 设置"转够这么多个弯后进盲走"
+ * after <= 0 → 不动阈值 */
+void fsm_set_turncount(int min_turns, int req_dir, int reset)
+{
+    if (reset) {
+        s_turn_cnt   = 0u;
+        s_blind_done = 0u;
+        s_dir_h1     = 0;
+        s_dir_h2     = 0;
+    }
+    if (min_turns > 0)                 s_blind_min_cnt = (float)min_turns;
+    if (req_dir >= -1 && req_dir <= 1) s_blind_req_dir = (int8_t)req_dir;
+}
+
+void fsm_get_turncount(int *cnt, int *min_turns, int *req_dir, int *used,
+                       int *h1, int *h2)
+{
+    if (cnt)       *cnt       = (int)s_turn_cnt;
+    if (min_turns) *min_turns = (int)(s_blind_min_cnt + 0.5f);
+    if (req_dir)   *req_dir   = (int)s_blind_req_dir;
+    if (used)      *used      = (int)s_blind_done;
+    if (h1)        *h1        = (int)s_dir_h1;
+    if (h2)        *h2        = (int)s_dir_h2;
+}
+
+/* 发车航向（盲走绝对目标的基准），给日志用 */
+float fsm_start_yaw(void) { return s_start_yaw; }
