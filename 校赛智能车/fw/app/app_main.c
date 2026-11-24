@@ -278,7 +278,12 @@ static void cli_help(void)
     app_log("[cli] c [kp kd vs vc] steering gains (x10) and straight/corner speeds\r\n");
     app_log("[cli] l [ratekp yawkp] rate loop gains (x100), -1 keeps\r\n");
     app_log("[cli] j            rate loop trace 50 ms (wref / gyro / dv)\r\n");
-    app_log("[cli] T [kp acc deg v brake inner]  turn params (kp x100, inner x100, -1 keeps)\r\n");
+    app_log("[cli] T [kp acc deg v brake inner outer]  turn params (kp/inner/outer x100)\r\n");
+    app_log("[cli] P [on err(x10) hold]  pre-turn (turn before the line is lost)\r\n");
+    app_log("[cli] D [1|-1|0]  turn direction lock (right/left/auto)\r\n");
+    app_log("[cli] N [1|0]  pretend blind done (debug: test loop entry only)\r\n");
+    app_log("[cli] S [vs vc vblind vloop vturn [brake]]  set all speeds at once (0=keep)\r\n");
+    app_log("[cli] M [min max]  blind-walk mileage window (mm, 0 0 = off)\r\n");
     app_log("[cli] C [min dir]  turn counter; blind after min corners with last two = dir\r\n");
     app_log("[cli] o            speed trace 50 ms\r\n");
     app_log("[cli] b            key identify mode (report only, no action)\r\n");
@@ -624,11 +629,12 @@ static void cli_exec(void)
         break;
 
     case 'T': {
-        /* T                                        查看定角转弯参数
-         * T <kp×100> <acc> <deg> [v] [brake]        设置（传 -1 表示这一项不改）
-         * 例：T 200 300 95 0        kp=2.00 acc=300 deg=95° v=0（纯原地差速转）
-         *     T -1 -1 -1 20        只把转弯前进速度改成 20 mm/s
-         *     T -1 -1 -1 -1 60     只把进弯刹车相从 220 ms 改成 60 ms
+        /* T                                                   查看定角转弯参数
+         * T <kp×100> <acc> <deg> [v] [brake] [inner] [outer]   设置（-1 = 不改该项）
+         * 例：T 200 300 95 0          kp=2.00 acc=300 deg=95° v=0（纯原地差速转）
+         *     T -1 -1 -1 20          只把转弯前进速度改成 20 mm/s
+         *     T -1 -1 -1 -1 60       只把进弯刹车相从 220 ms 改成 60 ms
+         *     T -1 -1 -1 -1 -1 140 90  内轮 1.40、外轮 0.90（车心往内收）
          *
          * 【为什么加这个命令】转弯参数原来全是宏，改一次要重编 + 烧录 2 分钟，
          * 而一次实车只能试 3~5 个弯，扫不动参数。现在一次编译、现场扫完。
@@ -639,6 +645,14 @@ static void cli_exec(void)
          *   v=0  时两轮变成 ±dv 对称反转 → 车心不动，转 90° 就对准新线。
          * 先试 v=0；若尾段两轮都掉进死区导致"卡住不动"，再试 10 / 20。
          *
+         * 【inner / outer 是调"车心往哪偏"的两个旋钮】v=0 时：
+         *   两轮等值反向  → 绕自身中心转，车心不动
+         *   外轮快/内轮慢 → 车心朝外偏（绕内轮转）—— 就是"转出去甩离黑线"
+         *   外轮慢/内轮快 → 车心朝内收
+         * 所以看到"转完离黑线太远、要靠巡线拉回来"时，正确做法是
+         *   **outer 调小 + inner 调大**（例：outer=0.90、inner=1.40），
+         * 一档一档试，每次只动 0.05。只改总差速没用 —— 那只影响转得快慢。
+         *
          * 【brake 是"进弯冲多远"的旋钮】丢线后要等 brake 这么久才开始转，
          * 这段时间车还带着速度往前冲（300 mm/s × 0.34 s ≈ 100 mm），
          * 冲出去的距离转 90° 之后**原封不动变成横向偏移** —— 这就是"车心往外溜"。
@@ -647,32 +661,73 @@ static void cli_exec(void)
          *   [el] 12→13 的 dist 差还有几十毫米 → 溜在"转的过程"，查 v 和打滑
          * brake 也不是越小越好：太小则车还带着 300 mm/s 就要求 ±420 差速，
          * 速度环跟不上，行为时好时坏。60~120 一般是甜点。 */
-        float kp, acc, deg, v, bk, inner;
+        float kp, acc, deg, v, bk, inner, outer;
         p = cli_skip(p + 1);
         if (*p == '\0') {
-            ctrl_get_turn(&kp, &acc, &deg, &v, &bk, &inner);
-            app_log("[cli] turn kp=%d.%02d acc=%d deg=%d v=%d brake=%d inner=%d.%02d\r\n",
+            ctrl_get_turn(&kp, &acc, &deg, &v, &bk, &inner, &outer);
+            app_log("[cli] turn kp=%d.%02d acc=%d deg=%d v=%d brake=%d inner=%d.%02d outer=%d.%02d\r\n",
                     (int)(kp * 100.0f + 0.5f) / 100, (int)(kp * 100.0f + 0.5f) % 100,
                     (int)(acc + 0.5f), (int)(deg + 0.5f), (int)(v + 0.5f), (int)(bk + 0.5f),
-                    (int)(inner * 100.0f + 0.5f) / 100, (int)(inner * 100.0f + 0.5f) % 100);
+                    (int)(inner * 100.0f + 0.5f) / 100, (int)(inner * 100.0f + 0.5f) % 100,
+                    (int)(outer * 100.0f + 0.5f) / 100, (int)(outer * 100.0f + 0.5f) % 100);
         } else {
             int32_t a = cli_num(&p); p = cli_skip(p);
             int32_t b = cli_num(&p); p = cli_skip(p);
             int32_t c = cli_num(&p); p = cli_skip(p);
             int32_t d = (*p == '\0') ? -1 : cli_num(&p); p = cli_skip(p);
             int32_t e = (*p == '\0') ? -1 : cli_num(&p); p = cli_skip(p);
-            int32_t f = (*p == '\0') ? -1 : cli_num(&p);
+            int32_t f = (*p == '\0') ? -1 : cli_num(&p); p = cli_skip(p);
+            int32_t g = (*p == '\0') ? -1 : cli_num(&p);
             ctrl_set_turn((a >= 0) ? (float)a / 100.0f : -1.0f,
                           (b >= 0) ? (float)b : -1.0f,
                           (c >= 0) ? (float)c : -1.0f,
                           (d >= 0) ? (float)d : -1.0f,
                           (e >= 0) ? (float)e : -1.0f,
-                          (f >= 0) ? (float)f / 100.0f : -1.0f);
-            ctrl_get_turn(&kp, &acc, &deg, &v, &bk, &inner);
-            app_log("[cli] set turn kp=%d.%02d acc=%d deg=%d v=%d brake=%d inner=%d.%02d\r\n",
+                          (f >= 0) ? (float)f / 100.0f : -1.0f,
+                          (g >= 0) ? (float)g / 100.0f : -1.0f);
+            ctrl_get_turn(&kp, &acc, &deg, &v, &bk, &inner, &outer);
+            app_log("[cli] set turn kp=%d.%02d acc=%d deg=%d v=%d brake=%d inner=%d.%02d outer=%d.%02d\r\n",
                     (int)(kp * 100.0f + 0.5f) / 100, (int)(kp * 100.0f + 0.5f) % 100,
                     (int)(acc + 0.5f), (int)(deg + 0.5f), (int)(v + 0.5f), (int)(bk + 0.5f),
-                    (int)(inner * 100.0f + 0.5f) / 100, (int)(inner * 100.0f + 0.5f) % 100);
+                    (int)(inner * 100.0f + 0.5f) / 100, (int)(inner * 100.0f + 0.5f) % 100,
+                    (int)(outer * 100.0f + 0.5f) / 100, (int)(outer * 100.0f + 0.5f) % 100);
+        }
+        break;
+    }
+
+    case 'O': {
+        /* O                          查看开环差速转弯参数
+         * O <mode> <dv> <ms>         设置（-1 = 该项不改）
+         * 例：O 1 260 1000   → 开环，差速 260 mm/s，持续 1000 ms
+         *     O 0            → 回到闭环（陀螺仪角度环 + 刹车曲线）
+         *
+         * 【为什么要有开环】实测指令 220°/s 只能跑出 42°/s（打滑 5 倍），
+         * 闭环一直在追一个追不到的目标，停在哪取决于当次打滑。
+         * 开环给固定差速时实际角速度是稳的：角度与时间成正比。
+         *
+         * 【标定】1) O 1 260 1000 跑一个弯
+         *         2) 看 [el] 12 → 13 的 yaw 差，比如转了 60°
+         *         3) 90° 需要 1000 × 90/60 = 1500 → O -1 -1 1500
+         *         4) 再跑一次核对，差 2~3° 以内就定下来
+         *
+         * dv 决定"转多快"和"打滑程度"：太大只会空转（角速度不再上升），
+         * 200~300 之间找一个稳的点。 */
+        float md, dv, ms;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            ctrl_get_turn_open(&md, &dv, &ms);
+            app_log("[cli] turn mode=%d dv=%d ms=%d\r\n",
+                    (int)(md + 0.5f), (int)(dv + 0.5f), (int)(ms + 0.5f));
+        } else {
+            int32_t a = cli_num(&p); p = cli_skip(p);
+            int32_t b = (*p == '\0') ? -1 : cli_num(&p); p = cli_skip(p);
+            int32_t c = (*p == '\0') ? -1 : cli_num(&p);
+            ctrl_set_turn_open((a >= 0) ? (float)a : -1.0f,
+                               (b >= 0) ? (float)b : -1.0f,
+                               (c >= 0) ? (float)c : -1.0f);
+            ctrl_get_turn_open(&md, &dv, &ms);
+            app_log("[cli] set turn mode=%d dv=%d ms=%d\r\n",
+                    (int)(md + 0.5f), (int)(dv + 0.5f), (int)(ms + 0.5f));
         }
         break;
     }
@@ -700,9 +755,13 @@ static void cli_exec(void)
         if (*p == '\0') {
             float sy = fsm_start_yaw();
             fsm_get_turncount(&cnt, &mn, &rd, &used, &h1, &h2);
+            int32_t wmn, wmx;
+            fsm_get_blind_win(&wmn, &wmx);
             app_log("[cli] turns=%d/%d req_dir=%d last=[%d,%d] blind_used=%d start_yaw=%d\r\n",
                     cnt, mn, rd, h1, h2, used,
                     (int)(sy + ((sy < 0.0f) ? -0.5f : 0.5f)));
+            app_log("[cli] blind win=%ld..%ld mm%s\r\n", (long)wmn, (long)wmx,
+                    (wmx > wmn) ? "" : "  (off)");
         } else {
             int32_t n = cli_num(&p); p = cli_skip(p);
             int32_t d = (*p == '\0') ? -2 : cli_num(&p);   /* -2 = 不改方向约束 */
@@ -821,6 +880,205 @@ static void cli_exec(void)
                 fsm_force_blind(0);
                 app_log("[cli] force blind off\r\n");
             }
+        }
+        break;
+    }
+
+    case 'P': {
+        /* P                        查看提前入弯（不停车转弯）参数
+         * P <on>                   开/关：1 = 线还没丢就开始转，0 = 回到"丢线才转"
+         * P <on> <err×10> [hold]   同时改阈值（权重单位×10）和持续时间 ms
+         * 例：P 1          → 打开，沿用当前阈值（默认 2.5 / 30 ms）
+         *     P 1 28 40    → 阈值 2.8、持续 40 ms（普通弯道也被提前转时用这个）
+         *     P 1 22 30    → 阈值 2.2（直角弯还是等丢线才转时用这个）
+         *     P 0          → 关掉，行为完全回到原来的"丢线 → 刹车 → 原地转"
+         *
+         * 【它干什么】在 EL_STRAIGHT 里，线偏到倒数第二路并持续 30 ms，
+         * 就认为前方是直角弯，直接进 EL_TURN90 按陀螺仪定角转，
+         * 不等 8 路彻底丢线。省的是"刹停 220 ms + 转完低速找线"这两段停顿。
+         *
+         * 【必须配合的 T 命令】不然"不停车"不成立：
+         *     T -1 -1 90 130 0 100 100
+         *   即 目标 90°、前进 130 mm/s、不刹车、内外轮 1.00。
+         *
+         * 【两道保护（原方案没有）】
+         *   · 上膛：只有线居中过才允许触发 → 出弯那几拍 err=3.0 不会连转两个弯
+         *   · 中止：转过约 50° 后线还在且已居中（≥2 路）→ 判定不是 90° 弯
+         *           （45° 斜切），立刻交回循迹。EL_TURN90 里位置环是关的，
+         *           不中止就会硬转满 90° 斜着出赛道。
+         *
+         * 日志里看 [turn] 那行的 pre=1 就知道这一弯是不是提前入弯触发的。 */
+        int   on;
+        float er, hd;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            fsm_get_preturn(&on, &er, &hd);
+            app_log("[cli] preturn %s err=%d.%d hold=%d ms\r\n",
+                    on ? "ON" : "off",
+                    (int)(er + 0.05f), (int)((er - (float)(int)er) * 10.0f + 0.5f),
+                    (int)(hd + 0.5f));
+        } else {
+            int32_t a = cli_num(&p); p = cli_skip(p);
+            int32_t b = (*p == '\0') ? -1 : cli_num(&p); p = cli_skip(p);
+            int32_t c = (*p == '\0') ? -1 : cli_num(&p);
+            fsm_set_preturn((a >= 0) ? (int)a : -1,
+                            (b >= 0) ? (float)b / 10.0f : -1.0f,
+                            (c >= 0) ? (float)c : -1.0f);
+            fsm_get_preturn(&on, &er, &hd);
+            app_log("[cli] set preturn %s err=%d.%d hold=%d ms\r\n",
+                    on ? "ON" : "off",
+                    (int)(er + 0.05f), (int)((er - (float)(int)er) * 10.0f + 0.5f),
+                    (int)(hd + 0.5f));
+        }
+        break;
+    }
+
+    case 'M': {
+        /* M                      查看盲走里程窗
+         * M <min> <max>          设置（相对"第一次看到线"的里程，mm）
+         * M 0 0                  关闭检查（默认）
+         *
+         * 【它是干什么的】断口在赛道上位置固定，所以"跑到哪儿了"是
+         * 转弯次数之外的第二信息源，任务书 docs/21 要求的三重同意之一。
+         * max <= min 时视为未配置，行为与以前完全一致。
+         *
+         * 【怎么标定】必须用"跑"的里程，手推的卷尺数不能用（打滑偏 6%）：
+         *   1) 保持 CFG_BLIND_MIN_TURNS=200（关闭触发），跑一圈
+         *   2) 记第 7 个弯结束时的 dist -> A（看 [el] 2 那行）
+         *   3) 记断口结束、线重新出现时的 dist -> B
+         *   4) M <A-150> <B+200>
+         * 配好之后再发 C 7 1 把计数判据打开。 */
+        int32_t mn, mx;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            fsm_get_blind_win(&mn, &mx);
+            app_log("[cli] blind win=%ld..%ld mm%s\r\n", (long)mn, (long)mx,
+                    (mx > mn) ? "" : "  (off, mileage not checked)");
+        } else {
+            int32_t a = cli_num(&p); p = cli_skip(p);
+            int32_t b = cli_num(&p);
+            fsm_set_blind_win((a >= 0) ? a : -1, (b >= 0) ? b : -1);
+            fsm_get_blind_win(&mn, &mx);
+            app_log("[cli] set blind win=%ld..%ld mm%s\r\n", (long)mn, (long)mx,
+                    (mx > mn) ? "" : "  (off, mileage not checked)");
+        }
+        break;
+    }
+
+    case 'S': {
+        /* S                                        查看全部速度
+         * S <vs> <vc> <vblind> <vloop> <vturn> [brake]   一次改全部（0 = 该项不改）
+         *
+         * 【为什么加它】提速阶段一次要动四五个速度，原来得分别发
+         *   c 55 0 330 330 / B 0 250 / T -1 -1 -1 70 60 / ...
+         * 四条命令、四个格式、四种单位（kp 是 ×10、角度是度、速度是 mm/s），
+         * 现场很容易发错。现在一条搞定，改完立刻回读确认。
+         *
+         * 例：
+         *   S 330 330 250 220 70        → 直道330 弯道330 盲走250 环岛220 转角70
+         *   S 350 0 0 0 0               → 只改直道
+         *   S 0 0 0 0 0 60              → 只改进弯刹车相 60 ms
+         *
+         * ⚠️ 环岛速度是本次新增的"运行时可调"（之前写死在表里，改一格要重烧）。
+         * ⚠️ 改完一定跑一圈验收：环岛 [el] 7 要 <12s 且不是靠超时退出。 */
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            float vs, vc, vc2, vh, kp, acc, deg, vt, bk, in, out;
+            int32_t bmm; float bv;
+            fsm_get_speeds(&vs, &vc);
+            fsm_get_blind(&bmm, &bv);
+            fsm_get_loop_speed(&vc2, &vh);
+            ctrl_get_turn(&kp, &acc, &deg, &vt, &bk, &in, &out);
+            app_log("[cli] S vs=%d vc=%d blind=%d(%ldmm) loop=%d/%d turn=%d brake=%d\r\n",
+                    (int)vs, (int)vc, (int)bv, (long)bmm,
+                    (int)vc2, (int)vh, (int)vt, (int)bk);
+        } else {
+            int32_t vs  = cli_num(&p); p = cli_skip(p);
+            int32_t vc  = cli_num(&p); p = cli_skip(p);
+            int32_t vb  = cli_num(&p); p = cli_skip(p);
+            int32_t vl  = cli_num(&p); p = cli_skip(p);
+            int32_t vt  = cli_num(&p); p = cli_skip(p);
+            int32_t bk  = cli_num(&p);
+            int32_t bmm; float bv;
+
+            /* fsm_set_speeds 内部：<=0 表示不改 */
+            if (vs > 0 || vc > 0) {
+                fsm_set_speeds((vs > 0) ? (float)vs : 0.0f,
+                               (vc > 0) ? (float)vc : 0.0f);
+            }
+            if (vb > 0) {
+                fsm_get_blind(&bmm, &bv);
+                fsm_set_blind(bmm, (float)vb);       /* 距离预算不变，只改速度 */
+            }
+            if (vl > 0) fsm_set_loop_speed(0.0f, (float)vl);
+            if (vt > 0 || bk > 0) {
+                /* ctrl_set_turn 的语义：>=0 才写，所以 -1 = 不改 */
+                ctrl_set_turn(-1.0f, -1.0f, -1.0f,
+                              (vt > 0) ? (float)vt : -1.0f,
+                              (bk > 0) ? (float)bk : -1.0f, -1.0f, -1.0f);
+            }
+            {
+                float vs2, vc2, vc3, vh2, kp2, acc2, deg2, vt2, bk2, in2, out2;
+                fsm_get_speeds(&vs2, &vc2);
+                fsm_get_blind(&bmm, &bv);
+                fsm_get_loop_speed(&vc3, &vh2);
+                ctrl_get_turn(&kp2, &acc2, &deg2, &vt2, &bk2, &in2, &out2);
+                app_log("[cli] set S vs=%d vc=%d blind=%d(%ldmm) loop=%d/%d turn=%d brake=%d\r\n",
+                        (int)vs2, (int)vc2, (int)bv, (long)bmm,
+                        (int)vc3, (int)vh2, (int)vt2, (int)bk2);
+            }
+        }
+        break;
+    }
+
+    case 'N': {
+        /* N            查看"假装已过盲走"的状态
+         * N 1          打开：允许从断口出口直接起步判环岛（调试用）
+         * N 0          关闭
+         *
+         * 【为什么要它】环岛入口有一道闸"必须走过盲走"（防止直角弯的贴边被误判）。
+         * 但从断口出口起步单练环岛时，盲走根本没走过 → 环岛永远不判。
+         * 打开它就等于告诉状态机"盲走已完成"，这样一次只要 10 秒，不用跑整圈 55 秒。
+         * 正常整圈跑时保持 0。它不受 a（发车）影响：先 N 1 再按 a。 */
+        int on;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            on = fsm_get_postblind();
+            app_log("[cli] postblind = %d (%s)\r\n", on,
+                    on ? "loop entry allowed" : "normal");
+        } else {
+            int32_t v = cli_num(&p);
+            fsm_set_postblind((v != 0) ? 1 : 0);
+            on = fsm_get_postblind();
+            app_log("[cli] set postblind = %d (%s)\r\n", on,
+                    on ? "loop entry allowed" : "normal");
+        }
+        break;
+    }
+
+    case 'D': {
+        /* D                    查看转弯方向锁
+         * D 1                  强制右转
+         * D -1                 强制左转
+         * D 0                  恢复自动（按丢线前误差符号判）
+         *
+         * 【为什么要它】"看 err 符号"判方向会被转完的航向偏差骗：
+         * 转完 err≈0 但车身还斜十几度，跑 100 mm 漂到线另一侧，
+         * 下一个弯丢线时 err 变成 -3.5/+3.5，方向就判反了 —— 整车掉头。
+         * 正方形这种固定方向的赛道直接锁死，不猜。
+         * 把车反过来放（练另一个方向）时，发一条 D -1 / D 1 即可。 */
+        int dir;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            dir = fsm_get_dir();
+            app_log("[cli] turn dir = %d (%s)\r\n", dir,
+                    (dir > 0) ? "RIGHT" : ((dir < 0) ? "LEFT" : "auto(err sign)"));
+        } else {
+            int32_t d = cli_num(&p);
+            fsm_set_dir((int)d);
+            dir = fsm_get_dir();
+            app_log("[cli] set turn dir = %d (%s)\r\n", dir,
+                    (dir > 0) ? "RIGHT" : ((dir < 0) ? "LEFT" : "auto(err sign)"));
         }
         break;
     }
@@ -1084,8 +1342,11 @@ static void comm_task(void *arg)
     uint32_t next_btdbg = 0u;
     uint32_t next_elw = 0u;
     uint32_t next_seek = 0u;
+    uint32_t next_tr   = 0u;    /* 盲走后连续跟踪的节拍 */
+    uint8_t  s_trace_on = 0u;   /* 1 = 正在连续跟踪（进过盲走就打开） */
     uint8_t  s_last_el = 0xFFu;
     uint32_t s_el_t0 = 0u;      /* 上一个元素是在什么时候进的，用来算 dt */
+    int16_t  s_el_yaw = 0;      /* 进入当前元素时的航向（0.1°），算"转弯实际转了多少" */
 
     (void)arg;
 
@@ -1125,8 +1386,13 @@ static void comm_task(void *arg)
          * 用于区分"任务没跑"和"接收线路不通"：
          *   有点   → comm_task 在跑，TX 正常，问题在 RX（线序/换行）
          *   没点   → comm_task 没跑起来（卡死或没创建）
-         * 收到第一条命令后自动静默。 */
-        if (!s_cli_seen && (uint32_t)(HAL_GetTick() - next_beat) >= 500u) {
+         * 收到第一条命令后自动静默。
+         *
+         * 2026-11-23：默认关闭（CFG_CLI_HEARTBEAT=0）。调车时这些点会把
+         * [el] / [turn] 日志冲得七零八落，手机上看着很乱。
+         * 怀疑接收线路有问题时把它改回 1 再排查。 */
+        if (CFG_CLI_HEARTBEAT && !s_cli_seen &&
+            (uint32_t)(HAL_GetTick() - next_beat) >= 500u) {
             next_beat = HAL_GetTick();
             app_log(".");
         }
@@ -1192,6 +1458,23 @@ static void comm_task(void *arg)
             if (st_snap(ctrl_shadow(), &es) && es.element != s_last_el) {
                 uint32_t now_el = HAL_GetTick();
                 uint32_t dt_el  = (s_last_el == 0xFFu) ? 0u : (now_el - s_el_t0);
+
+                /* 【刚出直角弯】打印这次**转弯本体**转过的角度 —— 只算 12 期间的
+                 * yaw 变化，不含之后的 SEEK / 循迹修正。这才是标定 CFG_TURN_DEG
+                 * 应该看的数据：如果用 el=12 到 el=2 的 yaw 差，会把 SEEK 里
+                 * 跟线回正的几度也算进去，看起来"总是少转"。 */
+                if (s_last_el == 12u) {
+                    int16_t dy  = (int16_t)(es.yaw_ddeg - s_el_yaw);
+                    int16_t ady;
+
+                    if (dy >  1800) dy = (int16_t)(dy - 3600);
+                    if (dy < -1800) dy = (int16_t)(dy + 3600);
+                    ady = (dy < 0) ? (int16_t)(-dy) : dy;
+                    app_log("[turn] done %c%d.%d deg\r\n",
+                            (dy < 0) ? '-' : '+',
+                            (int)(ady / 10), (int)(ady % 10));
+                }
+                s_el_yaw  = es.yaw_ddeg;
                 s_el_t0   = now_el;
                 s_last_el = es.element;
                 /* 带上"最后一次有效误差"、可见路数、和**当前航向**：
@@ -1214,8 +1497,12 @@ static void comm_task(void *arg)
                 if (es.element == 12u) {
                     int tc, tm, tr, td, th1, th2;
                     fsm_get_turncount(&tc, &tm, &tr, &td, &th1, &th2);
-                    app_log("[turn] #%d/%d dir=%d seq=[%d,%d]\r\n",
-                            tc, tm, th1, th2);
+                    /* ⚠️ 格式串里转换符的个数必须和参数个数一致。
+                     * 之前多写了一个 dir=%d，第 5 个参数读到栈上垃圾，
+                     * 日志里出现 seq=[0,536880852] 这种鬼数字。
+                     * pre=1 表示这一弯是"提前入弯"（线还没丢就开转）触发的。 */
+                    app_log("[turn] #%d/%d seq=[%d,%d] pre=%d\r\n",
+                            tc, tm, th1, th2, (int)fsm_turn_preturn());
                 }
             }
         }
@@ -1229,6 +1516,42 @@ static void comm_task(void *arg)
                 app_log("[seek] cnt=%u err=%d dist=%ld\r\n",
                         (unsigned)ks.track_count,
                         (int)ks.line_err, (long)ks.dist_mm);
+            }
+        }
+
+        /* 【盲走后连续跟踪】每 100 ms 一行，自动开启，直到停车。
+         *
+         * 为什么要自动：手工开 j/o 命令得记着按，而且跑完就没了；
+         * 而"环岛为什么没切进去/切进去后怎么走的"恰恰发生在盲走之后那几秒。
+         * 打的是 raw（8 路原始字节，**0 = 压线**）—— 判断入口形态唯一可靠的原始量。
+         * 注意 mask = reverse8(~raw)，所以"压线的是哪几路"要这么读：
+         *   raw=E7 → ~E7=18 → mask=18 → 压线 3,4（居中）
+         *   raw=F8 → ~F8=07 → mask=E0 → 压线 5,6,7（**线在右**）
+         *   raw=1F → ~1F=E0 → mask=07 → 压线 0,1,2（**线在左**）
+         *   raw=FF → 没有线      raw=00 → 8 路全黑
+         * 2026-11-24：旧注释把 E3/F8 的左右写反了，和 docs/22 §11.3 一并更正。
+         * cnt/err/yaw 配合看就能还原"它在环岛上到底怎么走的"。 */
+        if ((uint32_t)(HAL_GetTick() - next_tr) >= 100u) {
+            car_state_t ts;
+            next_tr = HAL_GetTick();
+            if (st_snap(ctrl_shadow(), &ts)) {
+                /* 进过盲走就开，停车/发车就关。
+                 * 【2026-11-24 扩】原来只对 el=5 打开，结果环岛那一段（在本赛道上
+                 * 位于断口**之前**，dist≈1200~4000）一条 [tr] 都没有，判据没法标定。
+                 * 现在进弯道态(3)/环岛(6,7)也打开，一旦打开就保持到停车。 */
+                if ((ts.element == 5u) || (ts.element == 3u) ||
+                    (ts.element == 6u) || (ts.element == 7u)) {
+                    s_trace_on = 1u;
+                } else if ((ts.element == 0u) || (ts.element == 1u) || (ts.element == 10u)) {
+                    s_trace_on = 0u;
+                }
+                if (s_trace_on) {
+                    app_log("[tr] el=%u raw=%02X cnt=%u err=%d yaw=%d w=%d dist=%ld\r\n",
+                            (unsigned)ts.element, (unsigned)ts.track_raw,
+                            (unsigned)ts.track_count, (int)ts.line_err,
+                            (int)(ts.yaw_ddeg / 10), (int)(ts.w_ref_ddps / 10),
+                            (long)ts.dist_mm);
+                }
             }
         }
 

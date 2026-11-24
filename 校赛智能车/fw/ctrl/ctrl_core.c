@@ -40,6 +40,10 @@ float g_turn_deg = CFG_TURN_DEG;   /* 目标转角 [°]，ctrl_fsm 进弯时读 
 float g_turn_v   = CFG_V_TURN;     /* 转弯前进速度 [mm/s]，0 = 纯原地差速转 */
 float g_turn_brake = (float)CFG_TURN_BRAKE_MS; /* 进弯刹车相时长 [ms] */
 float g_turn_inner = CFG_TURN_INNER; /* 内轮差速倍率，1.0 = 对称，>1 = 内轮多转 */
+float g_turn_outer = CFG_TURN_OUTER; /* 外轮差速倍率，<1 = 外轮少跑（车心往内收） */
+float g_turn_mode  = (float)CFG_TURN_MODE;      /* 0=闭环角度环，1=开环差速 */
+float g_turn_open_dv = CFG_TURN_OPEN_DV;        /* 开环差速 mm/s（带符号由 fsm 给） */
+float g_turn_open_ms = (float)CFG_TURN_OPEN_MS; /* 开环持续时间 ms */
 
 static pid_t   s_pid_l;
 static pid_t   s_pid_r;
@@ -411,9 +415,10 @@ void ctrl_set_rate(float rate_kp, float yaw_kp)
     if (yaw_kp  >= 0.0f) s_p.yaw_hold_kp = yaw_kp;
 }
 
-/* 在线改定角转弯的六个参数。传负值表示"这一项不改"。
+/* 在线改定角转弯的七个参数。传负值表示"这一项不改"。
  * 注意 v 传 0 是**有效值**（纯原地差速转），不要用 0 表示"不改"。 */
-void ctrl_set_turn(float kp, float acc, float deg, float v, float brake_ms, float inner)
+void ctrl_set_turn(float kp, float acc, float deg, float v, float brake_ms,
+                   float inner, float outer)
 {
     if (kp  >= 0.0f) g_turn_kp  = kp;
     if (acc >= 0.0f) g_turn_acc = acc;
@@ -421,9 +426,11 @@ void ctrl_set_turn(float kp, float acc, float deg, float v, float brake_ms, floa
     if (v   >= 0.0f) g_turn_v   = v;
     if (brake_ms >= 0.0f) g_turn_brake = brake_ms;
     if (inner    >= 0.0f) g_turn_inner = inner;
+    if (outer    >= 0.0f) g_turn_outer = outer;
 }
 
-void ctrl_get_turn(float *kp, float *acc, float *deg, float *v, float *brake_ms, float *inner)
+void ctrl_get_turn(float *kp, float *acc, float *deg, float *v, float *brake_ms,
+                   float *inner, float *outer)
 {
     if (kp)  *kp  = g_turn_kp;
     if (acc) *acc = g_turn_acc;
@@ -431,6 +438,22 @@ void ctrl_get_turn(float *kp, float *acc, float *deg, float *v, float *brake_ms,
     if (v)   *v   = g_turn_v;
     if (brake_ms) *brake_ms = g_turn_brake;
     if (inner)    *inner    = g_turn_inner;
+    if (outer)    *outer    = g_turn_outer;
+}
+
+/* 开环差速转弯参数（O 命令）。传负值表示不改。 */
+void ctrl_set_turn_open(float mode, float dv, float ms)
+{
+    if (mode >= 0.0f) g_turn_mode    = mode;
+    if (dv   >= 0.0f) g_turn_open_dv = dv;
+    if (ms   >= 0.0f) g_turn_open_ms = ms;
+}
+
+void ctrl_get_turn_open(float *mode, float *dv, float *ms)
+{
+    if (mode) *mode = g_turn_mode;
+    if (dv)   *dv   = g_turn_open_dv;
+    if (ms)   *ms   = g_turn_open_ms;
 }
 
 /* 直接指定航向参考。锁死盲走用：进盲走那一刻把参考置成绝对目标
@@ -722,6 +745,14 @@ void ctrl_step(void)
 
         w_ref    = turn_rate_cmd(dh_t, g_yaw_sgn);
         s_e_prev = e_f;         /* 保持微分历史连续，退出角度环那一刻不会打突 */
+    } else if (fo->w_mode == 2u) {
+        /* 开环差速（CFG_TURN_MODE=1）：不用陀螺仪、不走角速度环，
+         * 差速在下面的第 6 步直接取 fo->dv_open。
+         * 为什么这条路值得留着：实测指令 220°/s 只能跑出 42°/s（打滑 5 倍），
+         * 闭环一直在追一个追不到的目标，行为反而不可预测；
+         * 开环给固定差速时，实际角速度是稳的，可以用时间标定角度。 */
+        w_ref    = 0.0f;
+        s_e_prev = e_f;
     } else {
         /* PD：比例项负责"纠偏"，微分项负责"预判"。
          * 【缺陷④修正】循迹是 100 Hz 读的（每 2 拍），如果每拍都求导，
@@ -779,8 +810,15 @@ void ctrl_step(void)
         gyro_r = 0.0f;
     }
 
-    dv = CFG_RATE_FF * w_ref + s_p.rate_kp * (w_ref - gyro_r);
-    dv = clampf(dv, -CFG_DV_MAX, CFG_DV_MAX);
+    if (fo->w_mode == 2u) {
+        /* 【开环差速】差速直接取 fsm 给的值，绝不掺陀螺仪反馈 ——
+         * 这条路的全部意义就是"不看陀螺仪，靠固定差速 + 定时转定角度"。
+         * 上限仍用 CFG_DV_MAX，防止把轮子推到失控的转速。 */
+        dv = clampf(fo->dv_open, -CFG_DV_MAX, CFG_DV_MAX);
+    } else {
+        dv = CFG_RATE_FF * w_ref + s_p.rate_kp * (w_ref - gyro_r);
+        dv = clampf(dv, -CFG_DV_MAX, CFG_DV_MAX);
+    }
 
     /* ---------------- 7. 速度环 ---------------- */
     if (s_mode == CAR_MODE_REMOTE) {
@@ -799,15 +837,39 @@ void ctrl_step(void)
          * 默认 1.0 = 与原来完全一致。 */
         float dvo = dv;                    /* 外轮那一侧的差速 */
         float dvi = dv;                    /* 内轮那一侧的差速 */
+        float turn_sgn;                    /* 判断"往哪边转"用的量 */
 
-        if (fo->w_mode == 1u && g_turn_inner > 1.0f) {
+        /* 【外轮 / 内轮分别给系数】只在转弯（闭环 1 / 开环 2）时生效，循迹保持对称。
+         *
+         * 几何关系（v_cmd=0，以右转为例，内轮=右轮）：
+         *   vc = (vl+vr)/2 = dv·(outer−inner)/2
+         *   两轮等值反向（outer=inner） → vc=0，绕自身中心转，车心不动
+         *   outer > inner（外快内慢）   → vc>0，车一边前进一边右转 → 车心朝**右**（内侧）走
+         *   outer < inner（外慢内快）   → vc<0，车一边后退一边右转 → 车心朝**左**（外侧）走
+         *
+         * 所以：转完线偏在右侧（err>0，车偏左）→ 把 **outer 调大**（或 inner 调小）；
+         *       线偏在左侧（err<0，车偏右）→ 把 **outer 调小**（或 inner 调大）。
+         * 不要靠改总差速去补位置 —— 那只影响转得快慢，不改变车心往哪偏。
+         *
+         * 默认 outer=1.00、inner=1.25。现场用 T 命令第 6/7 参数（×100）调。 */
+        if ((fo->w_mode == 1u) || (fo->w_mode == 2u)) {
+            dvo = dv * g_turn_outer;
             dvi = dv * g_turn_inner;
-            if (dvi >  CFG_DV_MAX) dvi =  CFG_DV_MAX;
-            if (dvi < -CFG_DV_MAX) dvi = -CFG_DV_MAX;
+            /* ⚠️ 必须按**轮速上限** v_max 截，不能按 CFG_DV_MAX 截。
+             *
+             * 之前截到 DV_MAX(420) 有个隐蔽后果：rate_kp 一大，dv 本身就顶到
+             * 420，再乘 inner=1.25 得 525，被截回 420 —— **inner 等于没生效**，
+             * 调 1.25 和调 1.00 行为完全一样。2026-11-24 实测才暴露。
+             * 现在按 v_max(1000) 截，系数才真正作用到轮子上。 */
+            if (dvo >  s_p.v_max) dvo =  s_p.v_max;
+            if (dvo < -s_p.v_max) dvo = -s_p.v_max;
+            if (dvi >  s_p.v_max) dvi =  s_p.v_max;
+            if (dvi < -s_p.v_max) dvi = -s_p.v_max;
         }
-        /* 用 w_ref 的符号判断"往哪边转"，不要用 dv —— dv 含陀螺仪反馈项，
-         * 极端滞后时符号可能瞬时反向，会把内外轮搞反。 */
-        if (w_ref >= 0.0f) {               /* 右转：左外右内 */
+        /* 判断转向符号：闭环用 w_ref（不含陀螺仪反馈，不会被瞬时反号带偏），
+         * 开环 w_ref 恒为 0，必须改用 dv_open 的符号，否则左右转会被判反。 */
+        turn_sgn = (fo->w_mode == 2u) ? fo->dv_open : w_ref;
+        if (turn_sgn >= 0.0f) {            /* 右转：左外右内 */
             vl_ref = v_cmd + dvo;
             vr_ref = v_cmd - dvi;
         } else {                           /* 左转：右外左内 */

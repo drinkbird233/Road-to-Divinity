@@ -63,13 +63,25 @@ void  ctrl_set_rate(float rate_kp, float yaw_kp);
  * deg: 目标转角 [°]，EL_TURN90 进弯时读它
  * v  : 转弯前进速度 [mm/s]，0 = 纯原地差速转（两轮 ±dv 对称反转）
  * brake_ms : 进弯刹车相时长 [ms]，越长越稳但冲得越远
- * inner    : 内轮差速倍率，>1 让内轮多转（默认 1.0 = 对称）
- * 六项都是"传负值不改"，但 v=0 是有效值。 */
-void  ctrl_set_turn(float kp, float acc, float deg, float v, float brake_ms, float inner);
-void  ctrl_get_turn(float *kp, float *acc, float *deg, float *v, float *brake_ms, float *inner);
+ * inner    : 内轮差速倍率，>1 让内轮多转（默认 1.25）
+ * outer    : 外轮差速倍率，<1 让外轮少跑（默认 1.00）
+ *            两个一起调才能把"车心"收回路口：外轮慢 + 内轮快 → 车心往内收
+ * 七项都是"传负值不改"，但 v=0 是有效值。 */
+void  ctrl_set_turn(float kp, float acc, float deg, float v, float brake_ms,
+                    float inner, float outer);
+void  ctrl_get_turn(float *kp, float *acc, float *deg, float *v, float *brake_ms,
+                    float *inner, float *outer);
 
 /* 直接指定航向参考（锁死盲走用） */
 void  ctrl_set_yaw_ref(float yaw_deg);
+
+/* ---- 开环差速转弯（O 命令）----
+ * mode: 0 = 闭环角度环，1 = 开环差速 + 定时
+ * dv  : 开环差速 [mm/s]（两轮 ±dv，v_cmd=0，纯原地转）
+ * ms  : 开环持续时间 [ms]，从刹车相结束算起
+ * 传负值表示不改。 */
+void  ctrl_set_turn_open(float mode, float dv, float ms);
+void  ctrl_get_turn_open(float *mode, float *dv, float *ms);
 
 /* 定义在 ctrl_core.c，ctrl_fsm 直接读（与 g_yaw_sgn 同一个风格） */
 extern float g_turn_kp;
@@ -78,6 +90,10 @@ extern float g_turn_deg;
 extern float g_turn_v;
 extern float g_turn_brake;
 extern float g_turn_inner;
+extern float g_turn_outer;
+extern float g_turn_mode;
+extern float g_turn_open_dv;
+extern float g_turn_open_ms;
 
 /* 补线斜率（err/mm）：状态机用它区分弯道和断口 */
 float ctrl_pred_slope(void);
