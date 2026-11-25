@@ -160,6 +160,18 @@ static uint32_t  s_t_pre;
 static uint32_t  s_t_cool;       /* 离开 TURN90 的时刻，用于冷却 */
 static uint8_t   s_turn_pre;     /* 1 = 本次 TURN90 由提前入弯触发 */
 static uint8_t   s_pre_ok;       /* 中止判据的连续成立拍数 */
+/* 1 = 本次提前入弯是"线变宽（cnt>=CFG_PRE_TURN_CNT）"触发的。
+ * 为什么需要区分：宽黑是直角弯入口的形状（实测 raw=E0/E0 → 压线 5~7 路），
+ * 这种触发说明车正压在拐点上，**不该再走"45 度斜切"的中止判据** ——
+ * 中止判据会在车还在拐点上、传感器还看得见来路那条线时把转弯取消。
+ * 只有"线偏到边缘"（|err| 大）触发的，才可能是 45° 斜切，才需要中止。 */
+static uint8_t   s_pre_wide;
+/* 触发那一拍的形态快照（调试用，日志 [turn] ... cnt= e= 打出来） */
+static int32_t   s_d_loop_exit = -100000;  /* 上一次出环岛的里程（连进冷却用） */
+static float     s_loop_yaw0;              /* 判进环岛那一刻的航向（强制转弯的基准） */
+static uint8_t   s_loop_done;              /* 1 = 本圈已经绕过环岛（之后不许再判直角弯） */
+static uint8_t   s_trig_cnt;
+static int16_t   s_trig_err100;
 /* 上一次转完时的里程：用来做"转完冷却"。刚转完就再次丢线不是新弯，
  * 是残余误差（实测 ±3.0），再转一次就成了 200° 以上的掉头。 */
 static int32_t   s_d_turn_exit = -100000;
@@ -218,6 +230,15 @@ static int32_t   s_d_firstline = -1; /* 出盲走第一次看到线的里程 */
  * 于是在盲走里又看见线、60 mm 后就退出去了 —— 退出后车正好压在断口起点，
  * 连做两个假转弯，整趟崩掉。这条标志把"抢跑"变成"等真丢线"。 */
 static uint8_t   s_blind_needlost;
+/* 丢线确认时间（ms），串口 R 命令在线改。
+ * 【2026-11-24】原来固定 120 ms。实测从"最后看见线"到 EL_TURN90 建好，
+ * 车已经冲出去 65 mm（300 mm/s × 200 ms ≈ 60 mm），用户反馈"反应太慢"。
+ * 现在分两档：
+ *   线是**偏着丢的**（|err_lv| ≥ CFG_TURN_ARM_ERR） → 直角弯特征，用快的；
+ *   线是**居中丢的** → 可能是断口/反光，用慢的，别误判。
+ * 两者互不影响，所以快档可以压得很小而不牺牲断口识别。 */
+static uint16_t  s_confirm_fast = CFG_TURN_CONFIRM_FAST_MS;
+static uint16_t  s_confirm_slow = CFG_BLIND_ARM_MS;
 
 static float wrap180f(float d)
 {
@@ -244,6 +265,23 @@ static float turn_dir_from_err(void)
     if (s_dir_force > 0) return  1.0f;
     if (s_dir_force < 0) return -1.0f;
     return (s_err_lv >= 0.0f) ? 1.0f : -1.0f;
+}
+
+/* 直角弯方向（宽黑触发时用）。
+ * 宽黑那一帧 err 往往在 0 附近（实测 err=+1），符号不可靠；而"宽黑朝哪边多"
+ * 才是弯往哪边拐的直接证据：右转时出去的胶带向右侧延伸，实测 raw=E0 → mask=F8
+ * → 压线 5,6,7（右边缘到边）。
+ * 优先级：D 方向锁 > |err| 明显（>=0.5）> 形状 > err 符号。 */
+static float turn_dir_corner(int cnt, int le, int re, float err)
+{
+    if (s_dir_force > 0) return  1.0f;
+    if (s_dir_force < 0) return -1.0f;
+    if (absf(err) >= 0.5f) return (err >= 0.0f) ? 1.0f : -1.0f;
+    if (cnt >= (int)CFG_PRE_TURN_CNT) {
+        if (re >= 6) return  1.0f;
+        if (le <= 1) return -1.0f;
+    }
+    return (err >= 0.0f) ? 1.0f : -1.0f;
 }
 
 /* ===== 断口判据（docs/21 三重同意 + 里程兜底，2026-11-24 实车改成"或"）=====
@@ -336,6 +374,14 @@ static void enter(element_id_t el, int32_t d, float yaw, uint32_t t)
     }
     /* 离开直角弯：记录冷却起点，并清掉"这是提前入弯"的标记
      * （否则下一次从别的路径进来的 TURN90 会继承这个标记，走错的出弯分支） */
+    /* 离开环岛出口段：记里程，供"环岛不可连进"冷却用。
+     * 实测（run_222759）六边形连绕了 3 圈：出环后 36 mm 就再次判进入口，
+     * 因为**进环和出环都在同一个岔口**，出口必然又从宽黑上压过去。
+     * 不冷却就是死循环，一圈白烧 40 s。 */
+    if (s_o.el == EL_LOOP_OUT && el != EL_LOOP_OUT) {
+        s_d_loop_exit = d;
+        s_loop_done   = 1u;     /* 本圈绕过环岛了：之后不再允许"丢线→转 90°" */
+    }
     if (s_o.el == EL_TURN90 && el != EL_TURN90) {
         s_t_cool      = t;
         s_d_turn_exit = d;      /* 转完冷却的起点（毫米） */
@@ -381,6 +427,9 @@ static void enter_turn(element_id_t el, int32_t d, float yaw, uint32_t t, float 
      * 于是走错出弯分支（直接回 STRAIGHT、跳过 SEEK）。 */
     s_turn_pre     = 0u;
     s_pre_ok       = 0u;
+    s_pre_wide     = 0u;
+    s_trig_cnt     = 0u;        /* 0 = 不是提前入弯触发的（日志里 pre=0 时 c=0） */
+    s_trig_err100  = 0;
     s_turn_start   = yaw;               /* 记下起始航向，用来算"已经转过多少" */
     /* 目标角 = 当前航向 + 符号 * 方向 * 90。
      * 符号不可省：右转时 yaw 到底是变大还是变小取决于模块约定（g_yaw_sgn）。 */
@@ -408,6 +457,9 @@ void fsm_init(void)
     s_relock = 0u;
     s_loop_kind = LOOP_CIRCLE;
     s_loop_dir  = 1;
+    s_d_loop_exit = -100000;
+    s_loop_done   = 0u;
+    s_loop_yaw0   = 0.0f;
     s_v_loop[LOOP_CIRCLE] = CFG_V_LOOP_CIRCLE;
     s_v_loop[LOOP_HEX]    = CFG_V_LOOP_HEX;
     s_d_blind = 0;
@@ -424,6 +476,7 @@ void fsm_init(void)
     s_t_cool    = 0u;
     s_turn_pre  = 0u;
     s_pre_ok    = 0u;
+    s_pre_wide  = 0u;
     s_d_turn_exit = -100000;
     s_turn_cnt   = 0u;
     s_blind_done = 0u;
@@ -452,6 +505,7 @@ void fsm_arm(void)
     s_t_pre     = 0u;
     s_turn_pre  = 0u;
     s_pre_ok    = 0u;
+    s_pre_wide  = 0u;
     s_blind_needlost = 0u;
     s_t_edge      = 0u;     /* 环岛入口的贴边计时，不能带进新的一圈 */
     s_t_edge_last = 0u;
@@ -730,21 +784,83 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
          *      而且会持续很久。30 ms 的提前入弯会抢在 150 ms 的环岛判据之前开转，
          *      结果是把环岛入口当成直角弯。这里让环岛判据优先。
          * 方向直接用 err 的符号（正 = 线在右 = 右转），和丢线分支一致。 */
-        if (s_pre_on && s_pre_armed && line && (s_t_edge == 0u) &&
-            (absf(err) >= s_pre_err) &&
-            ((uint32_t)(tick_ms - s_t_cool) >= CFG_PRE_TURN_COOL_MS)) {
-            if (!s_pre_run) {
-                s_pre_run = 1u;
-                s_t_pre   = tick_ms;
+        {
+            /* 两路特征，谁先到用谁：
+             *   edge —— 线偏到视野边缘（|err| 大）。大弯道（斜着进弯）是这种。
+             *   wide —— 线**变宽**（连续压线 >= CFG_PRE_TURN_CNT 路）。
+             *           直角弯是这种：车正压在拐点上，来路 + 去路两条胶带同时
+             *           压在传感器上。实测 raw=E0 → 压线 5,6,7，err 却只有 +1
+             *           —— 只看 err 永远等不到（这也是"纯 PID 判不出来"的原因）。
+             *
+             * 【2026-11-25 为什么必须加 wide】
+             * 实测方场直角弯的时序（run_215809）：
+             *   4.189 dist=2450 raw=E0 cnt=5 err=+1   ← 线变宽：拐点在此
+             *   4.293 dist=2481 raw=F7 cnt=1          ← 100 ms 后只剩 1 路
+             *   4.596 dist=2573 raw=FF cnt=0          ← 彻底丢线
+             *   4.700 dist=2603                       ← EL_TURN90 才开始转
+             * 也就是说：真正该开转的位置在 2450，实际在 2603 —— **晚了 153 mm**。
+             * 而 300 mm/s 下这段要跑 500 ms，用户看到的就是"冲出去好多才转"。
+             *
+             * 更要紧的是连带后果：车带着 60 mm 的过冲进入旋转，转满 90° 时
+             * 新线已经在车身侧向 60 mm 处，超出 ±35 mm 视野 → 看不见 →
+             * 继续转到 105° 才让线进入视野边缘（实测 done 总是 104~105）→
+             * 转完 cnt=1、再走 100 mm 就丢线。**"冲出去"和"转多了"是同一件事。** */
+            /* edge 默认关闭（CFG_PRE_TURN_EDGE_EN=0），原因见 app_config.h：
+             * 曲线和环岛都是"单条胶带 + 车偏一侧"，err 很容易到 2.0，
+             * 用它触发必然把曲线当直角弯。真直角弯的签名是 cnt>=5。 */
+            uint8_t edge = (uint8_t)((CFG_PRE_TURN_EDGE_EN &&
+                                      (absf(err) >= s_pre_err)) ? 1u : 0u);
+            uint8_t wide = (uint8_t)((trk->count >= CFG_PRE_TURN_CNT &&
+                                      trk->count < 8u) ? 1u : 0u);
+            /* 环岛区不许抢：六边形入口同样是"线变宽"，而且它要的是"进环岛"
+             * 而不是"转 90°"。这里只按"已经走过盲走"来分区 —— 大赛道上
+             * 直角弯全在断口之前，走完盲走后没有 90° 弯，所以关掉不吃亏；
+             * 正方形闭环永远没走盲走，这条恒不生效。 */
+            uint8_t loop_zone = (uint8_t)((CFG_LOOP_AFTER_BLIND &&
+                                           (s_blind_done || s_dbg_postblind))
+                                          ? 1u : 0u);
+
+            /* 【2026-11-25 加：转完冷却（按里程）】
+             * 实测（run_221510，v_turn=40）第 5、6 个弯只隔 **82 mm**：
+             * 车转完 81° 时**还站在拐点的宽黑上**（cnt 仍是 5~6），
+             * 于是立刻被判成"下一个直角弯"，连着又转 105.9° → 直接出赛道。
+             *
+             * 时间冷却（CFG_PRE_TURN_COOL_MS=200）挡不住它：整段不到 200 ms。
+             * 唯一可靠的是**里程**——转完后必须开出去 CFG_TURN_COOL_MM(150) 才算离开
+             * 那个路口。这条和丢线分支用的是同一个冷却量（s_d_turn_exit）。 */
+            if (s_pre_on && s_pre_armed && line && (s_t_edge == 0u) &&
+                !loop_zone && (edge || wide) &&
+                ((uint32_t)(tick_ms - s_t_cool) >= CFG_PRE_TURN_COOL_MS) &&
+                ((s_d_turn_exit < 0) ||
+                 ((dist_mm - s_d_turn_exit) >= (int32_t)CFG_TURN_COOL_MM))) {
+                if (!s_pre_run) {
+                    s_pre_run  = 1u;
+                    s_t_pre    = tick_ms;
+                    s_pre_wide = wide;      /* 记住触发类型，TURN90 里要用 */
+                }
+                if ((float)(tick_ms - s_t_pre) >= s_pre_hold) {
+                    /* C89：声明必须在语句之前 */
+                    uint8_t tcnt = (uint8_t)trk->count;
+                    int16_t terr = (int16_t)(err * 100.0f);
+                    s_pre_run = 0u;
+                    enter_turn(EL_TURN90, dist_mm, yaw, tick_ms,
+                               turn_dir_corner((int)trk->count,
+                                               (int)trk->left_edge,
+                                               (int)trk->right_edge, err));
+                    s_turn_pre = 1u;        /* enter_turn 会清掉，这里置回 */
+                    /* ⚠️ 同一次调用里 s_pre_wide 也被 enter_turn 清了，必须一起置回。
+                     * 2026-11-25 实车症状：日志印 pre=1 w=0 c=5 —— 明明是"线变宽"
+                     * 触发的，却报成 0，于是 TURN90 里的"中止判据"还开着，
+                     * 转过 50° 后线一居中就把真正的直角弯取消掉。 */
+                    s_pre_wide    = wide;
+                    s_trig_cnt    = tcnt;
+                    s_trig_err100 = terr;
+                    break;
+                }
+            } else {
+                s_pre_run  = 0u;
+                s_pre_wide = 0u;
             }
-            if ((float)(tick_ms - s_t_pre) >= s_pre_hold) {
-                s_pre_run = 0u;
-                enter_turn(EL_TURN90, dist_mm, yaw, tick_ms, turn_dir_from_err());
-                s_turn_pre = 1u;        /* enter_turn 会清掉，这里置回 */
-                break;
-            }
-        } else {
-            s_pre_run = 0u;
         }
 
         /* 2) 丢线：盲走区 or 急弯丢线。用"丢线前的误差"区分：
@@ -758,7 +874,10 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
                  * 进 EL_BLIND 后 kp_scale=0（位置环断开）→ 车头回正 → 直冲出去。
                  * 这是"弯道冲出去"的直接原因之一。 */
             }
-            if (tick_ms - s_t_lost >= CFG_BLIND_ARM_MS) {
+            /* 偏着丢 → 直角弯特征，用快档；居中丢 → 断口/反光，用慢档 */
+            if ((tick_ms - s_t_lost) >=
+                ((absf(s_err_lv) >= CFG_TURN_ARM_ERR)
+                     ? (uint32_t)s_confirm_fast : (uint32_t)s_confirm_slow)) {
 
                 /* ===== 【转弯模式 → 进盲走 · 最高优先级】=====
                  * 任务书：docs/21_blind_trigger_task.md（"三重同意 + 里程兜底"）
@@ -781,6 +900,18 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
                         blind_go(dist_mm, yaw, tick_ms, 0u);
                         break;
                     }
+                }
+
+                /* 【2026-11-25 · 安全闸】绕过环岛之后再丢线，**不许再判直角弯**。
+                 * 实测代价（run_223758）：环岛没进去、直着开过去，出来丢线，
+                 * 于是被判成直角弯转了 105.6° —— 车直接被扔出赛道，
+                 * 接着又误进一次环岛、最后复位，整趟报废。
+                 * 赛道上最后一个环岛之后只剩"终点"，不可能再有直角弯。
+                 * 所以这里改走 SEEK：低速前进 + 位置环，找得到线就继续，
+                 * 找不到就由 CFG_LOST_STOP_MS 兜底停车。**宁可慢，不许转错。** */
+                if (s_loop_done) {
+                    enter(EL_SEEK, dist_mm, yaw, tick_ms);
+                    break;
                 }
 
                 /* ===== 【里程窗】断口位置固定，用"自起跑以来的里程"分流 =====
@@ -884,6 +1015,8 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
          * 所以条数本身就是足够强的特征；贴边与否只是视角差异，不该当判据。
          * 防止直角弯误判靠的是上面那道 s_blind_done 闸，不是这里。 */
         if (line && (CFG_LOOP_AFTER_BLIND == 0 || s_blind_done || s_dbg_postblind) &&
+            ((s_d_loop_exit < 0) ||
+             ((dist_mm - s_d_loop_exit) >= (int32_t)CFG_LOOP_COOL_MM)) &&
             trk->count >= FSM_LOOP_SIDE_CNT) {
             if (s_t_edge == 0u) s_t_edge = tick_ms;
             s_t_edge_last = tick_ms;       /* 记下这次命中 */
@@ -903,6 +1036,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
                 }
                 /* 本图的六边形要绕满 360°，圆形环岛同理，统一按 360° 表处理 */
                 s_loop_kind = LOOP_HEX;
+                s_loop_yaw0 = yaw;      /* 强制转弯的基准航向 */
                 s_o.e_bias = (s_loop_dir < 0) ? -FSM_LOOP_BIAS : FSM_LOOP_BIAS;
                 enter(EL_LOOP_IN, dist_mm, yaw, tick_ms);
                 break;
@@ -1108,6 +1242,29 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
          * 位置环看到的误差就是 0，没有任何理由往环岛那边打 —— 车必然直着过去。
          * 偏置 2.5 在 80 mm 内能把航向拉 20~30°，正好够咬住六边形那条边。
          * 圆形环岛如果因此甩过头，把 CFG_LOOP_ENTRY_MM 调小即可（80 → 50）。 */
+        if (CFG_LOOP_ENTRY_DEG > 0.5f) {
+            /* 【2026-11-25】强制转 CFG_LOOP_ENTRY_DEG 度，不跟线。
+             * 原因见 app_config.h：顶点处 err≈0，偏置只会平移不会转弯。
+             * 转到位（或走够里程上限）就交给 LOOP_RUN 跟线。 */
+            float dh;
+            s_o.e_bias     = 0.0f;
+            s_o.yaw_hold   = 0u;
+            s_o.kp_scale   = 0.0f;
+            s_o.w_mode     = 1u;
+            s_o.yaw_target = wrap180f(s_loop_yaw0 +
+                                      g_yaw_sgn * (float)s_loop_dir *
+                                      CFG_LOOP_ENTRY_DEG);
+            set_speed_target(s_v_loop[s_loop_kind]);
+            dh = wrap180f(s_o.yaw_target - yaw);
+            if ((absf(dh) < CFG_LOOP_ENTRY_TOL) ||
+                ((dist_mm - s_d_loop) > (int32_t)CFG_LOOP_ENTRY_MM)) {
+                s_o.w_mode = 0u;
+                enter(EL_LOOP_RUN, dist_mm, yaw, tick_ms);
+            }
+            break;
+        }
+
+        /* 旧行为（CFG_LOOP_ENTRY_DEG=0）：横向偏置 */
         s_o.e_bias   = (s_loop_dir < 0) ? -FSM_LOOP_BIAS : FSM_LOOP_BIAS;
         s_o.yaw_hold = 0u;
         s_o.kp_scale = 1.0f;
@@ -1184,7 +1341,9 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
          * 必须切到定角转弯。要求连续丢线 ≥ Blind_ARM_MS 再动手，防抖动误判。 */
         if (!line) {
             if (s_t_lost == 0u) s_t_lost = tick_ms;
-            if ((tick_ms - s_t_lost) >= CFG_BLIND_ARM_MS) {
+            if ((tick_ms - s_t_lost) >=
+                ((absf(s_err_lv) >= CFG_TURN_ARM_ERR)
+                     ? (uint32_t)s_confirm_fast : (uint32_t)s_confirm_slow)) {
                 /* 【断口优先 · 2026-11-24】盲走判据在 CORNER 里同样要生效。
                  * 原来只写在 EL_STRAIGHT 的丢线分支里，车一旦先被判进 CORNER
                  * （断口前的胶带残段会让 |err| 冲到 3.0，50 ms 就够进 CORNER），
@@ -1263,12 +1422,20 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
          * 主动开转的，如果还被这 220 ms 刹停挡一下，等于"提前停车再原地转"，
          * 比原方案更慢。所以 s_turn_pre 时直接跳过刹车相。
          * 要恢复"先停再转"，发 P 0 关掉提前入弯即可。 */
-        if (!s_turn_pre &&
-            (uint32_t)(tick_ms - s_t_enter) < (uint32_t)g_turn_brake) {
-            s_o.w_mode   = 0u;      /* 不转 */
-            s_o.kp_scale = 0.0f;    /* 也不用位置环 */
-            set_speed_target(0.0f); /* 刹停 */
-            break;
+        {
+            /* 提前入弯用独立、更短的刹车（CFG_PRE_TURN_BRAKE_MS）。
+             * 完全不刹（原来的做法）在 300 mm/s 下进弯，轮速要跳变 ~700 mm/s，
+             * 电机跟不上，前 200 ms 是滑行，每次滑多远都不一样 —— 实测转角
+             * 离散从 8° 涨到 37° 就是这么来的。给 50 ms 只花 15 mm，
+             * 但把每次入弯的初速拉到同一量级。 */
+            uint32_t brake_ms = s_turn_pre ? (uint32_t)CFG_PRE_TURN_BRAKE_MS
+                                           : (uint32_t)g_turn_brake;
+            if ((uint32_t)(tick_ms - s_t_enter) < brake_ms) {
+                s_o.w_mode   = 0u;      /* 不转 */
+                s_o.kp_scale = 0.0f;    /* 也不用位置环 */
+                set_speed_target(0.0f); /* 刹停 */
+                break;
+            }
         }
 
         /* 【最后一道保险】刹车相期间车已经停下来了，此时再问一次视觉：
@@ -1291,7 +1458,7 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
          *
          * 要求连续 2 拍成立、且"压线路数 ≥2"：旋转过程中传感器会扫过原来那条线，
          * 单拍、单路的瞬时居中不能当中止依据（那只是擦过，不是对正）。 */
-        if (s_turn_pre && line && (trk->count >= 2u) &&
+        if (s_turn_pre && !s_pre_wide && line && (trk->count >= 2u) &&
             (absf(err) < CFG_PRE_TURN_ABORT_ERR) &&
             (absf(wrap180f(yaw - s_turn_start)) >= CFG_PRE_TURN_ABORT_DEG)) {
             if (++s_pre_ok >= FSM_RELOCK_CYCLES) {
@@ -1381,9 +1548,15 @@ void fsm_step(const track_feat_t *trk, const imu_t *imu,
          * 超过就直接收手（去 SEEK 低速找线），绝不允许继续转到旧线上。 */
         {
             float rot = absf(wrap180f(yaw - s_turn_start));
+            /* 下限（防"扫过旧线"被当成对正）：
+             * 从**丢线**起转的，车头已经过冲，必须转满 95° 才可能看到新线；
+             * 从**拐点**起转的（提前入弯），90° 就到位，95° 会白转 5°，
+             * 所以用更低的下限。 */
+            float early_min = s_turn_pre ? CFG_TURN_EARLY_MIN_DEG_PRE
+                                         : CFG_TURN_EARLY_MIN_DEG;
 
             if (line && absf(err) < CFG_TURN_FIND_ERR &&
-                rot >= CFG_TURN_EARLY_MIN_DEG &&
+                rot >= early_min &&
                 rot <= (g_turn_deg + CFG_TURN_MAX_EXTRA_DEG)) {
                 if (++s_relock >= FSM_RELOCK_CYCLES) {
                     s_o.w_mode = 0u;
@@ -1585,6 +1758,18 @@ void fsm_get_preturn(int *on, float *err, float *hold_ms)
 /* 1 = 当前这次 TURN90 是提前入弯触发的（日志区分用） */
 uint8_t fsm_turn_preturn(void) { return s_turn_pre; }
 
+/* 1 = 这次提前入弯由"线变宽（cnt>=CFG_PRE_TURN_CNT）"触发，
+ * 0 = 由"线偏到边缘（|err| 大）"触发或不是提前入弯。日志区分用。 */
+uint8_t fsm_turn_wide(void) { return s_pre_wide; }
+
+/* 触发瞬间的形态快照：cnt = 连续压线路数，err100 = err×100。
+ * 用来在日志里一眼分辨"真直角(cnt>=5)"和"曲线(cnt<=3)"。 */
+void fsm_turn_trig(int *cnt, int *err100)
+{
+    if (cnt)    *cnt    = (int)s_trig_cnt;
+    if (err100) *err100 = (int)s_trig_err100;
+}
+
 /* ---------------- 转弯方向锁（串口 'D' 命令） ----------------
  * dir: +1 强制右转 / -1 强制左转 / 0 恢复"看 err 符号"。
  * 符号约定与 g_yaw_sgn 无关：+1 永远是物理右转。 */
@@ -1599,6 +1784,19 @@ int fsm_get_dir(void) { return (int)s_dir_force; }
 
 /* ---------------- 调试：假装盲走已走完（串口 K 命令） ----------------
  * 1 = 允许判环岛入口 / 0 = 关闭。掉电与发车都不会自动清，只有 K 0 才清。 */
+/* 丢线确认时间（串口 R）：0 = 不改 */
+void fsm_set_confirm_ms(int fast_ms, int slow_ms)
+{
+    if (fast_ms > 0) s_confirm_fast = (uint16_t)fast_ms;
+    if (slow_ms > 0) s_confirm_slow = (uint16_t)slow_ms;
+}
+
+void fsm_get_confirm_ms(int *fast_ms, int *slow_ms)
+{
+    if (fast_ms) *fast_ms = (int)s_confirm_fast;
+    if (slow_ms) *slow_ms = (int)s_confirm_slow;
+}
+
 void fsm_set_postblind(int on) { s_dbg_postblind = (uint8_t)(on ? 1 : 0); }
 int  fsm_get_postblind(void)   { return (int)s_dbg_postblind; }
 

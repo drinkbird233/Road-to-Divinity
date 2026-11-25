@@ -101,6 +101,10 @@ void  fsm_set_preturn(int on, float err_th, float hold_ms);
 void  fsm_get_preturn(int *on, float *err_th, float *hold_ms);
 /* 1 = 当前这次 EL_TURN90 是提前入弯进来的（日志用） */
 uint8_t fsm_turn_preturn(void);
+/* 1 = 提前入弯由"线变宽"触发（直角弯压在拐点上），0 = 由"线偏到边缘"触发 */
+uint8_t fsm_turn_wide(void);
+/* 触发瞬间的形态快照（cnt=连续压线路数, err100=err×100），日志用 */
+void fsm_turn_trig(int *cnt, int *err100);
 
 /* ---- 转弯方向锁（串口 'D'）----
  * +1 强制右转 / -1 强制左转 / 0 = 看"丢线前误差"的符号（旧行为）。
@@ -111,6 +115,11 @@ int   fsm_get_dir(void);
 
 /* ---- 调试：假装"盲走已走完"（串口 K）----
  * 只为了让车能从"断口出口"直接起步单独练环岛，不影响正常整圈逻辑。 */
+/* ---- 丢线确认时间（串口 R）---- 单位 ms，传 0 表示不改
+ * fast 用于"线偏着丢"（直角弯），slow 用于"线居中丢"（断口/反光）。 */
+void  fsm_set_confirm_ms(int fast_ms, int slow_ms);
+void  fsm_get_confirm_ms(int *fast_ms, int *slow_ms);
+
 void  fsm_set_postblind(int on);
 int   fsm_get_postblind(void);
 

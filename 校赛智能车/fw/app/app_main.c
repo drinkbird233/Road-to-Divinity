@@ -283,6 +283,7 @@ static void cli_help(void)
     app_log("[cli] D [1|-1|0]  turn direction lock (right/left/auto)\r\n");
     app_log("[cli] N [1|0]  pretend blind done (debug: test loop entry only)\r\n");
     app_log("[cli] S [vs vc vblind vloop vturn [brake]]  set all speeds at once (0=keep)\r\n");
+    app_log("[cli] R [fast slow]  line-loss confirm ms (corner / gap)\r\n");
     app_log("[cli] M [min max]  blind-walk mileage window (mm, 0 0 = off)\r\n");
     app_log("[cli] C [min dir]  turn counter; blind after min corners with last two = dir\r\n");
     app_log("[cli] o            speed trace 50 ms\r\n");
@@ -965,6 +966,33 @@ static void cli_exec(void)
         break;
     }
 
+    case 'R': {
+        /* R                     查看丢线确认时间
+         * R <fast> <slow>       设置（ms，0 = 不改）
+         *
+         * 【它解决什么问题】用户反馈"直角弯反应太慢，冲出去好多才开始转"。
+         * 实测从最后一次看见线到 EL_TURN90 建立共 65 mm，其中丢线确认占 36 mm。
+         * 原因：确认时间是固定 120 ms（原来是给"断口"用的保守值）。
+         *
+         * 现在分两档，互不影响：
+         *   fast —— 线是**偏着丢**的（|err_lv| ≥ 1.2）＝直角弯特征，用短的；
+         *   slow —— 线是**居中丢**的 ＝ 断口/反光，保持 120 ms 防误判。
+         * 例：R 25 120（更快） / R 60 120（更稳） / R 40 120（默认） */
+        int fm, sm;
+        p = cli_skip(p + 1);
+        if (*p == '\0') {
+            fsm_get_confirm_ms(&fm, &sm);
+            app_log("[cli] line-loss confirm: fast=%d ms (corner)  slow=%d ms (gap)\r\n", fm, sm);
+        } else {
+            int32_t a = cli_num(&p); p = cli_skip(p);
+            int32_t b = cli_num(&p);
+            fsm_set_confirm_ms((a > 0) ? (int)a : 0, (b > 0) ? (int)b : 0);
+            fsm_get_confirm_ms(&fm, &sm);
+            app_log("[cli] set confirm: fast=%d ms  slow=%d ms\r\n", fm, sm);
+        }
+        break;
+    }
+
     case 'S': {
         /* S                                        查看全部速度
          * S <vs> <vc> <vblind> <vloop> <vturn> [brake]   一次改全部（0 = 该项不改）
@@ -1501,8 +1529,16 @@ static void comm_task(void *arg)
                      * 之前多写了一个 dir=%d，第 5 个参数读到栈上垃圾，
                      * 日志里出现 seq=[0,536880852] 这种鬼数字。
                      * pre=1 表示这一弯是"提前入弯"（线还没丢就开转）触发的。 */
-                    app_log("[turn] #%d/%d seq=[%d,%d] pre=%d\r\n",
-                            tc, tm, th1, th2, (int)fsm_turn_preturn());
+                    /* pre=1 提前入弯；w=1 表示由"线变宽"触发（直角弯标志）；
+                     * c=触发时连续压线路数，e=触发时 err×100。
+                     * 真直角弯应该是 c>=5；曲线/环岛误判时会是 c<=3。 */
+                    {
+                        int tcnt, terr;
+                        fsm_turn_trig(&tcnt, &terr);
+                        app_log("[turn] #%d/%d seq=[%d,%d] pre=%d w=%d c=%d e=%d\r\n",
+                                tc, tm, th1, th2, (int)fsm_turn_preturn(),
+                                (int)fsm_turn_wide(), tcnt, terr);
+                    }
                 }
             }
         }
@@ -1539,7 +1575,12 @@ static void comm_task(void *arg)
                  * 【2026-11-24 扩】原来只对 el=5 打开，结果环岛那一段（在本赛道上
                  * 位于断口**之前**，dist≈1200~4000）一条 [tr] 都没有，判据没法标定。
                  * 现在进弯道态(3)/环岛(6,7)也打开，一旦打开就保持到停车。 */
-                if ((ts.element == 5u) || (ts.element == 3u) ||
+                /* 2026-11-25：把 el=2（直道）也算进来。
+                 * 原因：曲线段和环岛段的状态是 2→3→2，而 [tr] 原来只对
+                 * 3/5/6/7 开，导致"误判发生在曲线上"这一段一条细数据都没有，
+                 * 判据没法标定（每次只能靠猜）。现在从进入第一条直道起就开，
+                 * 一直到停车才关。60 s 一圈约 600 行，串口扛得住。 */
+                if ((ts.element == 2u) || (ts.element == 5u) || (ts.element == 3u) ||
                     (ts.element == 6u) || (ts.element == 7u)) {
                     s_trace_on = 1u;
                 } else if ((ts.element == 0u) || (ts.element == 1u) || (ts.element == 10u)) {
